@@ -1,0 +1,12 @@
+[package]
+name = "vfx_runtime"
+version = "0.1.0"
+edition = "2021"
+description = "Simulates and draws Smash Ultimate effects (nn::vfx) the way the game does"
+license = "MIT"
+
+[dependencies]
+effect_library = "1.1.4"
+
+[dev-dependencies]
+naga = { version = "29.0.1", features = ["wgsl-in"] }
