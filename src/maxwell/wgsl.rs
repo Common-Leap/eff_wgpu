@@ -50,6 +50,16 @@ pub struct Translation {
     pub uniform_control_flow: bool,
 }
 
+/// Binding of a constant bank. Each stage has its own literal bank (c[1]); the pixel stage's is
+/// moved to binding 3 so the two never share a slot.
+pub fn binding_of(bank: u8, kind: StageKind) -> u32 {
+    if bank == 1 && kind == StageKind::Fragment {
+        3
+    } else {
+        bank as u32
+    }
+}
+
 /// Size in 16-byte rows of every bound constant buffer (64 KiB, the hardware limit).
 pub const CBUF_ROWS: u32 = 4096;
 const DONE: u32 = 0xffff_ffff;
@@ -1227,7 +1237,7 @@ impl Translator {
         for (index, addr) in leaders.iter().enumerate() {
             self.blocks.insert(*addr, index as u32);
         }
-        let _ = writeln!(out, "    var pc = 0u;\n    var ssy: array<u32, 16>;\n    var sp = 0u;\n    loop {{\n        switch pc {{");
+        let _ = writeln!(out, "    var pc = 0u;\n    var ssy: array<u32, 16>;\n    var sp = 0u;\n    dbg_steps = 0u;\n    loop {{\n        dbg_steps = dbg_steps + 1u;\n        dbg_pc = pc;\n        if (dbg_steps > 100000u) {{ break; }}\n        switch pc {{");
         let mut i = 0;
         while i < insts.len() {
             let start = insts[i].addr;
@@ -1268,7 +1278,8 @@ impl Translator {
         for bank in &self.iface.banks {
             let _ = writeln!(
                 m,
-                "@group(0) @binding({bank}) var<uniform> cb{bank}: array<vec4<u32>, {CBUF_ROWS}>;"
+                "@group(0) @binding({}) var<uniform> cb{bank}: array<vec4<u32>, {CBUF_ROWS}>;",
+                binding_of(*bank, self.kind)
             );
         }
         for (slot, dim) in &self.iface.textures {
@@ -1323,6 +1334,7 @@ impl Translator {
             .collect();
         m.push_str(&regs);
         m.push_str(&preds);
+        m.push_str("var<private> dbg_pc: u32;\nvar<private> dbg_steps: u32;\n");
         m.push_str("var<private> cc_c: bool;\nvar<private> cc_z: bool;\nvar<private> cc_s: bool;\nvar<private> cc_o: bool;\n");
         m.push_str(CC_TEST_FN);
         match self.kind {
@@ -1378,7 +1390,8 @@ impl Translator {
     }
 }
 
-const CC_TEST_FN: &str = "fn cc(test: u32) -> bool {
+const CC_TEST_FN: &str = "fn sp_dbg() -> u32 { return 0u; }
+fn cc(test: u32) -> bool {
     switch test {
         case 0u: { return false; }
         case 1u: { return cc_s != cc_o; }
@@ -1534,4 +1547,42 @@ fn unsigned_max(bytes: u8) -> f32 {
         2 => 65535.0,
         _ => 4294967040.0,
     }
+}
+
+/// A translated vertex stage rewritten as a compute shader, for checking what it computes:
+/// invocation `i` runs vertex `i % 4` of instance `i / 4` with inputs from `dbg_in` (one vec4
+/// per input location per instance, in `interface.inputs` order) and writes the position then
+/// each output varying to `dbg_out`. Bound at `@group(2)`.
+pub fn vertex_as_compute(t: &Translation) -> String {
+    let source = &t.source;
+    let cut = source.find("@vertex\nfn main").unwrap_or(source.len());
+    let mut m = source[..cut].to_string();
+    let inputs: Vec<u32> = t.interface.inputs.iter().copied().collect();
+    let outputs: Vec<u32> = t.interface.outputs.iter().copied().collect();
+    let _ = writeln!(
+        m,
+        "@group(2) @binding(0) var<storage, read> dbg_in: array<vec4<f32>>;\n@group(2) @binding(1) var<storage, read_write> dbg_out: array<vec4<f32>>;\n@compute @workgroup_size(1)\nfn main(@builtin(global_invocation_id) gid: vec3<u32>) {{\n    let i = gid.x;\n    vertex_id = i % 4u;\n    instance_id = i / 4u;"
+    );
+    for (k, loc) in inputs.iter().enumerate() {
+        let _ = writeln!(
+            m,
+            "    vin.a{loc} = dbg_in[instance_id * {}u + {k}u];",
+            inputs.len()
+        );
+    }
+    let _ = writeln!(
+        m,
+        "    let o = run();\n    let base = i * {}u;\n    dbg_out[base] = o.pos;",
+        outputs.len() + 2
+    );
+    let _ = writeln!(
+        m,
+        "    dbg_out[base + {}u] = vec4<f32>(f32(dbg_pc), f32(dbg_steps), f32(sp_dbg()), 0.0);",
+        outputs.len() + 1
+    );
+    for (k, loc) in outputs.iter().enumerate() {
+        let _ = writeln!(m, "    dbg_out[base + {}u] = o.v{loc};", k + 1);
+    }
+    m.push_str("}\n");
+    m
 }

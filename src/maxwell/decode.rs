@@ -600,7 +600,14 @@ fn branch_target(w: u64, addr: u32) -> u32 {
     } else {
         off
     };
-    (addr as i32 + 8 + off) as u32
+    let target = (addr as i32 + 8 + off) as u32;
+    // A target at a bundle start is the bundle's scheduling word; execution begins at the
+    // first instruction after it.
+    if target % 32 == 0 {
+        target + 8
+    } else {
+        target
+    }
 }
 
 fn fsetp_like(w: u64) -> (FMod, FMod) {

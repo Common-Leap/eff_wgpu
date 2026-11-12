@@ -42,7 +42,24 @@ pub struct Stage {
     /// Maxwell code as the GPU runs it, after the 0x30-byte NVN prefix when present: a shader
     /// program header (SPH, 0x50 bytes) for graphics stages, then the instructions.
     pub code: Vec<u8>,
+    /// NVN's control section for the stage (it carries the program's constant bank 1).
+    pub control: Vec<u8>,
     pub reflection: Reflection,
+}
+
+impl Stage {
+    /// The program's own constant bank (c[1]): literals the compiler moved out of the code,
+    /// stored after the instructions at the offset and size the control section gives.
+    pub fn literals(&self) -> &[u8] {
+        let word = |at: usize| {
+            self.control
+                .get(at..at + 4)
+                .map(|b| u32::from_le_bytes(b.try_into().unwrap()) as usize)
+                .unwrap_or(0)
+        };
+        let (offset, size) = (word(0x6f8), word(0x6fc));
+        self.code.get(offset..offset + size).unwrap_or_default()
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -129,6 +146,13 @@ fn read_program(r: &Reader, variation: usize) -> Result<Program, Error> {
         if code_at == 0 {
             continue;
         }
+        let control_offset = r.u64(code_at + 8)? as usize;
+        let control_size = r.u32(code_at + 28)? as usize;
+        let control = if control_offset != 0 {
+            r.bytes(control_offset, control_size)?.to_vec()
+        } else {
+            Vec::new()
+        };
         let code_offset = r.u64(code_at + 16)? as usize;
         let code_size = r.u32(code_at + 24)? as usize;
         let mut code = r.bytes(code_offset, code_size)?;
@@ -148,6 +172,7 @@ fn read_program(r: &Reader, variation: usize) -> Result<Program, Error> {
         };
         program.stages[stage] = Some(Stage {
             code: code.to_vec(),
+            control,
             reflection,
         });
     }

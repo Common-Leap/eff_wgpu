@@ -4,3 +4,8 @@
 
 pub mod bnsh;
 pub mod maxwell;
+pub mod ptcl;
+pub mod render;
+pub mod sim;
+pub mod static_block;
+pub mod view_block;
