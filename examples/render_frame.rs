@@ -82,8 +82,18 @@ fn main() {
         for _ in 0..frame {
             s.step();
         }
-        let streams = s.streams(&Mat4::IDENTITY);
-        let dynamic = s.dynamic_block(&Mat4::IDENTITY, &Mat4::IDENTITY, [1.0; 4]);
+        let srt = s.emitter_srt(&Mat4::IDENTITY);
+        let mut streams = s.streams(&srt);
+        // PROBE_VERTEX="x,y,u,v,alpha": one mesh vertex's inputs, for probing mesh programs.
+        if let Ok(v) = std::env::var("PROBE_VERTEX") {
+            let f: Vec<f32> = v.split(',').map(|x| x.parse().unwrap()).collect();
+            let n = s.count();
+            streams.insert("sysPosAttr", vec![[f[0], f[1], 0.0, 1.0]; n]);
+            streams.insert("sysTexCoordAttr", vec![[f[2], f[3], 0.0, 0.0]; n]);
+            streams.insert("sysNormalAttr", vec![[0.0, 0.0, 1.0, 0.0]; n]);
+            streams.insert("sysVertexColor0Attr", vec![[1.0, 1.0, 1.0, f[4]]; n]);
+        }
+        let dynamic = s.dynamic_block(&srt, &s.emitter_rt(&Mat4::IDENTITY), [1.0; 4]);
         let statics = static_block::static_block(fixed_data);
         let rs = &e.data.render_state;
         let program = e.data.shader_references.shader_index as usize;

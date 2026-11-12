@@ -39,8 +39,10 @@ impl Blend {
         match kind {
             1 => Blend::Add,
             2 => Blend::Sub,
-            3 => Blend::Screen,
-            4 => Blend::Multiply,
+            // Rendercontext::Initialize (SMO 0xb51990): 3 is (zero, src colour), 4 is
+            // (one minus dst colour, one).
+            3 => Blend::Multiply,
+            4 => Blend::Screen,
             _ => Blend::Normal,
         }
     }
@@ -147,7 +149,6 @@ pub struct EffectRenderer {
     group1: wgpu::BindGroupLayout,
     zero_bank: wgpu::Buffer,
     view_bank: wgpu::Buffer,
-    zero_stream: wgpu::Buffer,
     blank: wgpu::TextureView,
     blank_sampler: wgpu::Sampler,
 }
@@ -249,7 +250,6 @@ impl EffectRenderer {
             group1,
             zero_bank: buffer("vfx zero bank", BANK_BYTES),
             view_bank: buffer("vfx view bank", BANK_BYTES),
-            zero_stream: buffer("vfx zero stream", MAX_INSTANCES * 16),
             blank,
             blank_sampler: device.create_sampler(&wgpu::SamplerDescriptor::default()),
         }

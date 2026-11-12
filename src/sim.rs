@@ -67,6 +67,14 @@ pub struct EmitterSim<'a> {
     rng: Lcg,
     /// Emitter time (emitter+0x44).
     pub time: f32,
+    /// Fade-in (emitter+0x74): 0 to 1 over res+0x76c frames when res+0x75b (alpha) or
+    /// res+0x75c (scale) asks for it, else 1 (Emitter::Initialize, EmitterCalculator::Calculate).
+    fade_in: f32,
+    /// The emitter's own transform in its set (emitter+0x2c0, CreateResMatrix): translation,
+    /// rotation and scale with their random spreads.
+    local: Mat4,
+    /// The same without scale (emitter+0x300).
+    local_rt: Mat4,
     timer: f32,
     interval: f32,
     accumulated: f32,
@@ -75,16 +83,39 @@ pub struct EmitterSim<'a> {
 
 impl<'a> EmitterSim<'a> {
     pub fn new(data: &'a EmitterData, raw: &'a [u8]) -> Self {
+        let mut rng = Lcg(data.random_seed);
+        let (local, local_rt) = res_matrix(raw, &mut rng);
         Self {
             data,
             raw,
-            rng: Lcg(data.random_seed),
+            rng,
+            local,
+            local_rt,
             time: 0.0,
+            fade_in: if raw.get(0x75b).copied().unwrap_or(0) != 0
+                || raw.get(0x75c).copied().unwrap_or(0) != 0
+            {
+                0.0
+            } else {
+                1.0
+            },
             timer: f32::MAX,
             interval: 0.0,
             accumulated: 0.0,
             particles: Vec::new(),
         }
+    }
+
+    /// The emitter's matrix (emitter+0x340, UpdateEmitterMatrix): the set's matrix times the
+    /// emitter's own.
+    pub fn emitter_srt(&self, set: &Mat4) -> Mat4 {
+        *set * self.local
+    }
+
+    /// The emitter's matrix without scale (emitter+0x380): the set's, without scale, times
+    /// the emitter's own without scale.
+    pub fn emitter_rt(&self, set_rt: &Mat4) -> Mat4 {
+        *set_rt * self.local_rt
     }
 
     pub fn count(&self) -> usize {
@@ -172,6 +203,14 @@ impl<'a> EmitterSim<'a> {
 
     /// One frame: emission, then motion; the emitter time advances by one.
     pub fn step(&mut self) {
+        if self.fade_in < 1.0 {
+            let frames = i32_at(self.raw, 0x76c);
+            self.fade_in = if frames < 1 {
+                1.0
+            } else {
+                (self.fade_in + 1.0 / frames as f32).min(1.0)
+            };
+        }
         let frame = self.time;
         let emission = &self.data.emission;
         let start = emission.start as f32;
@@ -271,15 +310,47 @@ impl<'a> EmitterSim<'a> {
         v[9] = self.particles.len() as f32;
         v[10] = 0.0;
         v[11] = 1.0;
-        v[12] = 1.0;
-        v[13] = 1.0;
-        v[14] = 1.0;
-        v[15] = 1.0;
+        // Alpha and scale multipliers: the set's own (1 here) times the fade-in when the
+        // emitter asks for it. The fade-out on kill (emitter+0x70) is not modelled: it stays 1.
+        let fade = |flag: usize| {
+            if r.get(flag).copied().unwrap_or(0) != 0 {
+                self.fade_in
+            } else {
+                1.0
+            }
+        };
+        v[12] = fade(0x75b);
+        let scale = fade(0x75c);
+        v[13] = scale;
+        v[14] = scale;
+        v[15] = scale;
         let rows = |m: &Mat4| m.transpose().to_cols_array();
         v[16..32].copy_from_slice(&rows(srt));
         v[32..48].copy_from_slice(&rows(rt));
         v.iter().flat_map(|x| x.to_le_bytes()).collect()
     }
+}
+
+/// Emitter::CreateResMatrix (Smash 0x2c80): rotation res+0x788 + res+0x794 * (2r - 1) per axis,
+/// translation res+0x770 + res+0x77c * (2r - 1), scale res+0x7a0; six draws, rotation first.
+/// The rows it writes are the columns of T * Rz * Ry * Rx * S.
+fn res_matrix(raw: &[u8], rng: &mut Lcg) -> (Mat4, Mat4) {
+    let mut jitter =
+        |base: usize, spread: usize| f32_at(raw, base) + f32_at(raw, spread) * rng.signed();
+    let rotation = [
+        jitter(0x788, 0x794),
+        jitter(0x78c, 0x798),
+        jitter(0x790, 0x79c),
+    ];
+    let translation = Vec3::new(
+        jitter(0x770, 0x77c),
+        jitter(0x774, 0x780),
+        jitter(0x778, 0x784),
+    );
+    let scale = Vec3::new(f32_at(raw, 0x7a0), f32_at(raw, 0x7a4), f32_at(raw, 0x7a8));
+    let rotate = Mat4::from_euler(glam::EulerRot::ZYX, rotation[2], rotation[1], rotation[0]);
+    let rt = Mat4::from_translation(translation) * rotate;
+    (rt * Mat4::from_scale(scale), rt)
 }
 
 /// Spawn position and outward direction by volume type (g_EmitFunctions order).
