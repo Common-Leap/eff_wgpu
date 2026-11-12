@@ -38,6 +38,8 @@ impl Lcg {
 struct Live {
     position: Vec3,
     velocity: Vec3,
+    /// Movement over the last frame (LocalDiff).
+    diff: Vec3,
     life: f32,
     birth: f32,
     scale: [f32; 4],
@@ -153,6 +155,7 @@ impl<'a> EmitterSim<'a> {
             self.particles.push(Live {
                 position,
                 velocity: vel,
+                diff: vel,
                 life,
                 birth: self.time,
                 scale: scale4,
@@ -208,6 +211,7 @@ impl<'a> EmitterSim<'a> {
         let air = statics.air_res;
         for particle in &mut self.particles {
             particle.position += particle.velocity;
+            particle.diff = particle.velocity;
             if air != 1.0 {
                 particle.velocity *= air;
             }
@@ -235,7 +239,9 @@ impl<'a> EmitterSim<'a> {
                 p.velocity.z,
                 p.birth,
             ]);
-            out.entry("sysLocalDiffAttr").or_default().push([0.0; 4]);
+            out.entry("sysLocalDiffAttr")
+                .or_default()
+                .push([p.diff.x, p.diff.y, p.diff.z, 0.0]);
             out.entry("sysScaleAttr").or_default().push(p.scale);
             out.entry("sysRandomAttr").or_default().push(p.random);
             out.entry("sysInitRotateAttr").or_default().push(p.rotate);

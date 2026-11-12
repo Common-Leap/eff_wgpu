@@ -113,7 +113,17 @@ pub struct EmitterDraw<'a> {
     /// Texture for each sampler slot the emitter uses.
     pub textures: [Option<&'a wgpu::TextureView>; 3],
     pub samplers: [Option<&'a wgpu::Sampler>; 3],
+    /// The emitter's mesh primitive, when it draws one instead of a quad.
+    pub mesh: Option<&'a crate::mesh::Mesh>,
 }
+
+/// Inputs a mesh supplies per vertex, in `mesh::Mesh` vertex order.
+const VERTEX_NAMES: [&str; 4] = [
+    "sysPosAttr",
+    "sysTexCoordAttr",
+    "sysNormalAttr",
+    "sysVertexColor0Attr",
+];
 
 struct Compiled {
     vertex: wgpu::ShaderModule,
@@ -132,7 +142,7 @@ pub struct EffectRenderer {
     depth: Option<wgpu::TextureFormat>,
     programs: Vec<Program>,
     compiled: HashMap<usize, Result<Compiled, String>>,
-    pipelines: HashMap<(usize, RenderState), wgpu::RenderPipeline>,
+    pipelines: HashMap<(usize, RenderState, bool), wgpu::RenderPipeline>,
     group0: wgpu::BindGroupLayout,
     group1: wgpu::BindGroupLayout,
     zero_bank: wgpu::Buffer,
@@ -452,9 +462,32 @@ impl EffectRenderer {
         })
     }
 
-    fn pipeline(&mut self, program: usize, state: RenderState) -> Option<&wgpu::RenderPipeline> {
+    /// Input locations fed per vertex (mesh) and per instance (particle), in buffer order.
+    fn split_inputs(c: &Compiled, mesh: bool) -> (Vec<(u32, usize)>, Vec<u32>) {
+        let mut per_vertex = Vec::new();
+        let mut per_instance = Vec::new();
+        for loc in &c.vs.inputs {
+            let name = c
+                .locations
+                .iter()
+                .find(|(_, l)| *l == loc)
+                .map(|(n, _)| n.as_str());
+            match name.and_then(|n| VERTEX_NAMES.iter().position(|v| *v == n)) {
+                Some(slot) if mesh => per_vertex.push((*loc, slot)),
+                _ => per_instance.push(*loc),
+            }
+        }
+        (per_vertex, per_instance)
+    }
+
+    fn pipeline(
+        &mut self,
+        program: usize,
+        state: RenderState,
+        mesh: bool,
+    ) -> Option<&wgpu::RenderPipeline> {
         self.compile(program).ok()?;
-        if !self.pipelines.contains_key(&(program, state)) {
+        if !self.pipelines.contains_key(&(program, state, mesh)) {
             let c = self.compiled[&program].as_ref().ok()?;
             let layout = self
                 .device
@@ -463,26 +496,38 @@ impl EffectRenderer {
                     bind_group_layouts: &[Some(&self.group0), Some(&self.group1)],
                     immediate_size: 0,
                 });
-            // All streams interleaved in one instance buffer, one vec4 each in input order.
-            let attributes: Vec<wgpu::VertexAttribute> =
-                c.vs.inputs
-                    .iter()
-                    .enumerate()
-                    .map(|(i, loc)| wgpu::VertexAttribute {
-                        format: wgpu::VertexFormat::Float32x4,
-                        offset: i as u64 * 16,
-                        shader_location: *loc,
-                    })
-                    .collect();
-            let buffers = if attributes.is_empty() {
-                Vec::new()
-            } else {
-                vec![wgpu::VertexBufferLayout {
-                    array_stride: attributes.len() as u64 * 16,
+            // Slot 0: the mesh's four vertex inputs (64 bytes a vertex). Slot 1: every particle
+            // stream interleaved, one vec4 each in input order.
+            let (per_vertex, per_instance) = Self::split_inputs(c, mesh);
+            let vertex_attributes: Vec<wgpu::VertexAttribute> = per_vertex
+                .iter()
+                .map(|(loc, slot)| wgpu::VertexAttribute {
+                    format: wgpu::VertexFormat::Float32x4,
+                    offset: *slot as u64 * 16,
+                    shader_location: *loc,
+                })
+                .collect();
+            let instance_attributes: Vec<wgpu::VertexAttribute> = per_instance
+                .iter()
+                .enumerate()
+                .map(|(i, loc)| wgpu::VertexAttribute {
+                    format: wgpu::VertexFormat::Float32x4,
+                    offset: i as u64 * 16,
+                    shader_location: *loc,
+                })
+                .collect();
+            let buffers = vec![
+                wgpu::VertexBufferLayout {
+                    array_stride: 64,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &vertex_attributes,
+                },
+                wgpu::VertexBufferLayout {
+                    array_stride: (instance_attributes.len().max(1) as u64) * 16,
                     step_mode: wgpu::VertexStepMode::Instance,
-                    attributes: &attributes,
-                }]
-            };
+                    attributes: &instance_attributes,
+                },
+            ];
             let compare = match state.depth_func {
                 0 => wgpu::CompareFunction::Never,
                 1 => wgpu::CompareFunction::Less,
@@ -505,7 +550,11 @@ impl EffectRenderer {
                         buffers: &buffers,
                     },
                     primitive: wgpu::PrimitiveState {
-                        topology: wgpu::PrimitiveTopology::TriangleStrip,
+                        topology: if mesh {
+                            wgpu::PrimitiveTopology::TriangleList
+                        } else {
+                            wgpu::PrimitiveTopology::TriangleStrip
+                        },
                         cull_mode: match state.display_side {
                             1 => Some(wgpu::Face::Back),
                             2 => Some(wgpu::Face::Front),
@@ -538,9 +587,9 @@ impl EffectRenderer {
                     multiview_mask: None,
                     cache: None,
                 });
-            self.pipelines.insert((program, state), pipeline);
+            self.pipelines.insert((program, state, mesh), pipeline);
         }
-        self.pipelines.get(&(program, state))
+        self.pipelines.get(&(program, state, mesh))
     }
 
     /// Upload one emitter's data and record its draw. Buffers live in the returned frame data,
@@ -550,8 +599,9 @@ impl EffectRenderer {
         if count == 0 {
             return None;
         }
-        self.pipeline(draw.program, draw.state)?;
-        let pipeline = self.pipelines[&(draw.program, draw.state)].clone();
+        let mesh = draw.mesh.is_some();
+        self.pipeline(draw.program, draw.state, mesh)?;
+        let pipeline = self.pipelines[&(draw.program, draw.state, mesh)].clone();
         let c = self.compiled[&draw.program].as_ref().ok()?;
         let make = |label: &str, bytes: &[u8], usage: wgpu::BufferUsages, size: u64| {
             let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
@@ -617,7 +667,7 @@ impl EffectRenderer {
         });
         let by_location: HashMap<u32, &str> =
             c.locations.iter().map(|(n, l)| (*l, n.as_str())).collect();
-        let inputs: Vec<u32> = c.vs.inputs.iter().copied().collect();
+        let (_, inputs) = Self::split_inputs(c, mesh);
         let mut interleaved: Vec<[f32; 4]> = Vec::with_capacity(count as usize * inputs.len());
         for i in 0..count as usize {
             for loc in &inputs {
@@ -630,33 +680,65 @@ impl EffectRenderer {
                 interleaved.push(value);
             }
         }
-        let instances = (!inputs.is_empty()).then(|| {
-            make(
-                "vfx instances",
-                bytemuck_cast(&interleaved),
-                wgpu::BufferUsages::VERTEX,
-                16,
-            )
-        });
+        if interleaved.is_empty() {
+            interleaved.push([0.0; 4]);
+        }
+        let instances = Some(make(
+            "vfx instances",
+            bytemuck_cast(&interleaved),
+            wgpu::BufferUsages::VERTEX,
+            16,
+        ));
+        let (vertices, indices) = match draw.mesh {
+            Some(m) => {
+                let flat: Vec<[f32; 4]> = m.vertices.iter().flatten().copied().collect();
+                let idx: Vec<u8> = m.indices.iter().flat_map(|i| i.to_le_bytes()).collect();
+                (
+                    make(
+                        "vfx mesh",
+                        bytemuck_cast(&flat),
+                        wgpu::BufferUsages::VERTEX,
+                        64,
+                    ),
+                    Some((
+                        make("vfx indices", &idx, wgpu::BufferUsages::INDEX, 4),
+                        m.indices.len() as u32,
+                    )),
+                )
+            }
+            None => (
+                make("vfx quad", &[0u8; 256], wgpu::BufferUsages::VERTEX, 256),
+                None,
+            ),
+        };
         let _ = &c.fs;
         Some(PreparedDraw {
             pipeline,
             group0,
             group1,
             instances,
+            vertices,
+            indices,
             count,
             _keep: vec![statics, dynamic],
         })
     }
 
-    pub fn draw<'p>(&'p self, pass: &mut wgpu::RenderPass<'p>, prepared: &'p PreparedDraw) {
+    pub fn draw(&self, pass: &mut wgpu::RenderPass<'_>, prepared: &PreparedDraw) {
         pass.set_pipeline(&prepared.pipeline);
         pass.set_bind_group(0, &prepared.group0, &[]);
         pass.set_bind_group(1, &prepared.group1, &[]);
+        pass.set_vertex_buffer(0, prepared.vertices.slice(..));
         if let Some(buffer) = &prepared.instances {
-            pass.set_vertex_buffer(0, buffer.slice(..));
+            pass.set_vertex_buffer(1, buffer.slice(..));
         }
-        pass.draw(0..4, 0..prepared.count);
+        match &prepared.indices {
+            Some((buffer, n)) => {
+                pass.set_index_buffer(buffer.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..*n, 0, 0..prepared.count);
+            }
+            None => pass.draw(0..4, 0..prepared.count),
+        }
     }
 }
 
@@ -665,6 +747,8 @@ pub struct PreparedDraw {
     group0: wgpu::BindGroup,
     group1: wgpu::BindGroup,
     instances: Option<wgpu::Buffer>,
+    vertices: wgpu::Buffer,
+    indices: Option<(wgpu::Buffer, u32)>,
     count: u32,
     _keep: Vec<wgpu::Buffer>,
 }
@@ -687,4 +771,20 @@ impl MaxLen for Vec<u8> {
         }
         self
     }
+}
+
+/// Smash's sysCustomShaderUniformBlock2 (0x50 bytes) as its effect manager sets it up
+/// (main 0x260ab0c on v0): row 0 x is the draw's multiplier (1), rows 0-1 otherwise carry stage
+/// lighting, row 1 z is -1 (set per draw at 0x2600fxx; directional particles cross their motion
+/// with -z times the eye vector), row 2 is (1, 0, 1, 0), row 3 per-set data (0), row 4
+/// (1, -99999, 1, 0).
+pub fn default_custom2() -> Vec<u8> {
+    let rows: [f32; 20] = [
+        1.0, 0.0, 0.0, 0.0, //
+        0.0, 0.0, -1.0, 0.0, //
+        1.0, 0.0, 1.0, 0.0, //
+        0.0, 0.0, 0.0, 0.0, //
+        1.0, -99999.0, 1.0, 0.0,
+    ];
+    rows.iter().flat_map(|v| v.to_le_bytes()).collect()
 }

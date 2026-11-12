@@ -4,6 +4,7 @@
 
 pub mod bnsh;
 pub mod maxwell;
+pub mod mesh;
 pub mod ptcl;
 pub mod render;
 pub mod sim;

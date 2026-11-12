@@ -92,7 +92,7 @@ fn main() {
             continue;
         }
         let custom = static_block::custom_block(raw);
-        let custom2: Vec<u8> = [1.0f32; 20].iter().flat_map(|v| v.to_le_bytes()).collect();
+        let custom2 = render::default_custom2();
         let draw = render::EmitterDraw {
             program,
             state: render::RenderState {
@@ -114,6 +114,7 @@ fn main() {
             count: s.count() as u32,
             textures: [None; 3],
             samplers: [None; 3],
+            mesh: None,
         };
         eprintln!(
             "emitter {j}: program {program}, {} particles, blend {:?}",

@@ -400,6 +400,16 @@ impl Translator {
         };
         let mut body = String::new();
         self.emit_op(&mut body, &inst.op, &inner_ind, dispatch, inst.addr)?;
+        // Debug aid (VFX_NAN_TRACE): remember the first instruction that leaves a NaN behind.
+        if std::env::var_os("VFX_NAN_TRACE").is_some() && !ends_block(&inst.op) {
+            for r in written(&inst.op) {
+                let _ = writeln!(
+                    body,
+                    "{inner_ind}if (dbg_nan == 0u && (r{r} & 0x7f800000u) == 0x7f800000u && (r{r} & 0x7fffffu) != 0u) {{ dbg_nan = {}u; }}",
+                    inst.addr
+                );
+            }
+        }
         if guarded {
             let _ = writeln!(out, "{ind}if ({}) {{", self.p(inst.guard));
             out.push_str(&body);
@@ -1334,7 +1344,9 @@ impl Translator {
             .collect();
         m.push_str(&regs);
         m.push_str(&preds);
-        m.push_str("var<private> dbg_pc: u32;\nvar<private> dbg_steps: u32;\n");
+        m.push_str(
+            "var<private> dbg_pc: u32;\nvar<private> dbg_steps: u32;\nvar<private> dbg_nan: u32;\n",
+        );
         m.push_str("var<private> cc_c: bool;\nvar<private> cc_z: bool;\nvar<private> cc_s: bool;\nvar<private> cc_o: bool;\n");
         m.push_str(CC_TEST_FN);
         match self.kind {
@@ -1390,7 +1402,7 @@ impl Translator {
     }
 }
 
-const CC_TEST_FN: &str = "fn sp_dbg() -> u32 { return 0u; }
+const CC_TEST_FN: &str = "fn sp_dbg() -> u32 { return dbg_nan; }
 fn cc(test: u32) -> bool {
     switch test {
         case 0u: { return false; }
