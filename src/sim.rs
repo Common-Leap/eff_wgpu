@@ -83,7 +83,7 @@ pub struct EmitterSim<'a> {
 
 impl<'a> EmitterSim<'a> {
     pub fn new(data: &'a EmitterData, raw: &'a [u8]) -> Self {
-        let mut rng = Lcg(data.random_seed);
+        let mut rng = Lcg(seed(raw));
         let (local, local_rt) = res_matrix(raw, &mut rng);
         Self {
             data,
@@ -306,9 +306,12 @@ impl<'a> EmitterSim<'a> {
         v[5] = colour[1] * f32_at(r, 0x7c0);
         v[6] = colour[2] * f32_at(r, 0x7c4);
         v[7] = colour[3] * f32_at(r, 0x7c8);
-        v[8] = self.time;
+        // The game draws a frame before its time advances: after the spawn frame's Calculate
+        // the dynamic block holds time 0 and the fade-in has already taken its first step
+        // (live capture: time 4 with fade 5/6). `self.time` counts steps taken, one ahead.
+        v[8] = (self.time - 1.0).max(0.0);
         v[9] = self.particles.len() as f32;
-        v[10] = 0.0;
+        v[10] = 1.0;
         v[11] = 1.0;
         // Alpha and scale multipliers: the set's own (1 here) times the fade-in when the
         // emitter asks for it. The fade-out on kill (emitter+0x70) is not modelled: it stays 1.
@@ -329,6 +332,13 @@ impl<'a> EmitterSim<'a> {
         v[32..48].copy_from_slice(&rows(rt));
         v.iter().flat_map(|x| x.to_le_bytes()).collect()
     }
+}
+
+/// The emitter's random seed (Emitter::Initialize): res+0x757 picks fixed (2: res+0x760 times
+/// 0xdfdc1c35), the set's seed (1) or the global generator (0). The last two differ per spawn
+/// in game; the fixed formula stands in for them so a preview is repeatable.
+fn seed(raw: &[u8]) -> u32 {
+    (i32_at(raw, 0x760) as u32).wrapping_mul(0xdfdc_1c35)
 }
 
 /// Emitter::CreateResMatrix (Smash 0x2c80): rotation res+0x788 + res+0x794 * (2r - 1) per axis,

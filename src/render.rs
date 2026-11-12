@@ -516,18 +516,26 @@ impl EffectRenderer {
                     shader_location: *loc,
                 })
                 .collect();
-            let buffers = vec![
-                wgpu::VertexBufferLayout {
-                    array_stride: 64,
-                    step_mode: wgpu::VertexStepMode::Vertex,
-                    attributes: &vertex_attributes,
-                },
-                wgpu::VertexBufferLayout {
-                    array_stride: (instance_attributes.len().max(1) as u64) * 16,
-                    step_mode: wgpu::VertexStepMode::Instance,
-                    attributes: &instance_attributes,
-                },
-            ];
+            let instance_layout = wgpu::VertexBufferLayout {
+                array_stride: (instance_attributes.len().max(1) as u64) * 16,
+                step_mode: wgpu::VertexStepMode::Instance,
+                attributes: &instance_attributes,
+            };
+            // Quads read nothing per vertex (corners come from the vertex index): their
+            // particle streams go in slot 0. An attribute-less layout in front of them left
+            // every stream reading zero, so quad emitters collapsed to a point.
+            let buffers = if mesh {
+                vec![
+                    wgpu::VertexBufferLayout {
+                        array_stride: 64,
+                        step_mode: wgpu::VertexStepMode::Vertex,
+                        attributes: &vertex_attributes,
+                    },
+                    instance_layout,
+                ]
+            } else {
+                vec![instance_layout]
+            };
             let compare = match state.depth_func {
                 0 => wgpu::CompareFunction::Never,
                 1 => wgpu::CompareFunction::Less,
@@ -728,9 +736,14 @@ impl EffectRenderer {
         pass.set_pipeline(&prepared.pipeline);
         pass.set_bind_group(0, &prepared.group0, &[]);
         pass.set_bind_group(1, &prepared.group1, &[]);
-        pass.set_vertex_buffer(0, prepared.vertices.slice(..));
+        let instance_slot = if prepared.indices.is_some() {
+            pass.set_vertex_buffer(0, prepared.vertices.slice(..));
+            1
+        } else {
+            0
+        };
         if let Some(buffer) = &prepared.instances {
-            pass.set_vertex_buffer(1, buffer.slice(..));
+            pass.set_vertex_buffer(instance_slot, buffer.slice(..));
         }
         match &prepared.indices {
             Some((buffer, n)) => {
@@ -787,4 +800,66 @@ pub fn default_custom2() -> Vec<u8> {
         1.0, -99999.0, 1.0, 0.0,
     ];
     rows.iter().flat_map(|v| v.to_le_bytes()).collect()
+}
+
+/// A decoded texture on the GPU with all its mip levels.
+pub fn upload_texture(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    texture: &crate::texture::Texture,
+) -> wgpu::TextureView {
+    use wgpu::util::DeviceExt;
+    let data: Vec<u8> = texture.mips.iter().flatten().copied().collect();
+    let gpu = device.create_texture_with_data(
+        queue,
+        &wgpu::TextureDescriptor {
+            label: Some("vfx texture"),
+            size: wgpu::Extent3d {
+                width: texture.width,
+                height: texture.height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: texture.mips.len() as u32,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        },
+        wgpu::util::TextureDataOrder::MipMajor,
+        &data,
+    );
+    gpu.create_view(&Default::default())
+}
+
+/// A sampler as nn::vfx's TextureSampler::Initialize builds it: wrap 0 mirror, 1 repeat,
+/// 2 clamp to edge, 3 mirror once (clamped); a non-zero filter byte means point sampling.
+pub fn make_sampler(
+    device: &wgpu::Device,
+    wrap_u: u8,
+    wrap_v: u8,
+    filter: u8,
+    max_lod: f32,
+) -> wgpu::Sampler {
+    let mode = |m: u8| match m {
+        1 => wgpu::AddressMode::Repeat,
+        2 | 3 => wgpu::AddressMode::ClampToEdge,
+        _ => wgpu::AddressMode::MirrorRepeat,
+    };
+    let f = if filter != 0 {
+        wgpu::FilterMode::Nearest
+    } else {
+        wgpu::FilterMode::Linear
+    };
+    device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some("vfx sampler"),
+        address_mode_u: mode(wrap_u),
+        address_mode_v: mode(wrap_v),
+        address_mode_w: wgpu::AddressMode::MirrorRepeat,
+        mag_filter: f,
+        min_filter: f,
+        mipmap_filter: wgpu::MipmapFilterMode::Linear,
+        lod_max_clamp: max_lod.clamp(0.0, 32.0),
+        ..Default::default()
+    })
 }

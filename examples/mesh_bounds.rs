@@ -27,15 +27,21 @@ fn main() {
             m.indices.len()
         );
         if std::env::var_os("RADIAL").is_some() {
-            let mut rows: Vec<(f32, f32)> = m
+            let mut rows: Vec<(f32, f32, f32, f32)> = m
                 .vertices
                 .iter()
-                .map(|v| ((v[0][0].powi(2) + v[0][1].powi(2)).sqrt(), v[3][3]))
+                .map(|v| {
+                    (
+                        (v[0][0].powi(2) + v[0][1].powi(2)).sqrt(),
+                        v[3][3],
+                        v[1][0],
+                        v[1][1],
+                    )
+                })
                 .collect();
             rows.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-            rows.dedup_by(|a, b| (a.0 - b.0).abs() < 0.01 && (a.1 - b.1).abs() < 0.01);
-            for (r, a) in rows {
-                println!("  r {r:.2} alpha {a:.2}");
+            for (r, a, u, v) in rows.iter().step_by(9) {
+                println!("  r {r:.2} alpha {a:.2} uv {u:.3} {v:.3}");
             }
         }
         for (s, name) in ["pos", "uv", "normal", "colour"].iter().enumerate() {

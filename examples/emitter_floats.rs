@@ -13,7 +13,7 @@ fn main() {
         .iter()
         .zip(&eff.entries)
         .find(|(name, _)| name.eq_ignore_ascii_case(&a[2]))
-        .map(|(_, e)| e.emitter_set_id as usize)
+        .map(|(_, e)| e.emitter_set_id as usize - 1)
         .unwrap();
     for (j, (e, r)) in p.emitter_list.emitter_sets[set]
         .emitters

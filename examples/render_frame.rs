@@ -58,8 +58,13 @@ fn main() {
     let view = target.create_view(&Default::default());
     let mut renderer = render::EffectRenderer::new(&device, &queue, &shaders, format, None);
 
-    let eye = Vec3::new(0.0, 10.0, 40.0);
-    let cam = Mat4::look_at_rh(eye, Vec3::new(0.0, 8.0, 0.0), Vec3::Y);
+    // CAMERA="distance": look at the origin from +Z (the game's side view).
+    let distance: f32 = std::env::var("CAMERA")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(40.0);
+    let eye = Vec3::new(0.0, 0.0, distance);
+    let cam = Mat4::look_at_rh(eye, Vec3::ZERO, Vec3::Y);
     let proj = Mat4::perspective_rh(45f32.to_radians(), 1.0, 1.0, 1000.0);
     let rows = |m: Mat4| m.transpose().to_cols_array_2d();
     renderer.set_view(
@@ -76,8 +81,43 @@ fn main() {
             static_block::fixed_emitter_data(raw, &|_| None, None),
         ));
     }
+    let only: Option<usize> = std::env::var("ONLY").ok().and_then(|v| v.parse().ok());
+    let meshes = vfx_runtime::mesh::meshes(&ptcl_file);
+    let ids: Vec<u64> = ptcl_file
+        .texture_info
+        .as_ref()
+        .map(|i| i.descriptors.iter().map(|d| d.id).collect())
+        .unwrap_or_default();
+    let mut views = Vec::new();
+    let mut samplers = Vec::new();
+    for (e, _, _) in &fixed {
+        let slots = [&e.data.sampler0, &e.data.sampler1, &e.data.sampler2];
+        views.push(slots.map(|s| {
+            let wanted = s.as_ref()?.texture_id;
+            let index = ids.iter().position(|id| *id == wanted)?;
+            let t = vfx_runtime::texture::decode(&ptcl_file, index)?;
+            Some(render::upload_texture(&device, &queue, &t))
+        }));
+        samplers.push(slots.map(|s| {
+            let s = s.as_ref()?;
+            Some(render::make_sampler(
+                &device,
+                s.wrap_u.as_u8(),
+                s.wrap_v.as_u8(),
+                s.filter,
+                s.max_lod,
+            ))
+        }));
+    }
     let mut prepared = Vec::new();
     for (j, (e, raw, fixed_data)) in fixed.iter().enumerate() {
+        if only.is_some_and(|o| o != j) {
+            continue;
+        }
+        let mesh_id = u64::from_le_bytes(fixed_data[0x8c8..0x8d0].try_into().unwrap());
+        let mesh = (mesh_id != u64::MAX)
+            .then(|| meshes.get(&mesh_id))
+            .flatten();
         let mut s = sim::EmitterSim::new(&e.data, fixed_data);
         for _ in 0..frame {
             s.step();
@@ -85,6 +125,11 @@ fn main() {
         let srt = s.emitter_srt(&Mat4::IDENTITY);
         let mut streams = s.streams(&srt);
         // PROBE_VERTEX="x,y,u,v,alpha": one mesh vertex's inputs, for probing mesh programs.
+        if let Ok(v) = std::env::var("PROBE_RANDOM") {
+            let f: Vec<f32> = v.split(',').map(|x| x.parse().unwrap()).collect();
+            let n = s.count();
+            streams.insert("sysRandomAttr", vec![[f[0], f[1], f[2], f[3]]; n]);
+        }
         if let Ok(v) = std::env::var("PROBE_VERTEX") {
             let f: Vec<f32> = v.split(',').map(|x| x.parse().unwrap()).collect();
             let n = s.count();
@@ -122,9 +167,9 @@ fn main() {
             custom2_block: Some(&custom2),
             streams: &streams,
             count: s.count() as u32,
-            textures: [None; 3],
-            samplers: [None; 3],
-            mesh: None,
+            textures: std::array::from_fn(|k| views[j][k].as_ref()),
+            samplers: std::array::from_fn(|k| samplers[j][k].as_ref()),
+            mesh,
         };
         eprintln!(
             "emitter {j}: program {program}, {} particles, blend {:?}",
@@ -132,7 +177,14 @@ fn main() {
             draw.state.blend
         );
         if std::env::var_os("PROBE").is_some() {
-            if let Some((outs, values)) = renderer.probe_vertex(&queue, &draw, 1) {
+            if let Some((outs, values)) = renderer.probe_vertex(
+                &queue,
+                &draw,
+                std::env::var("PROBE_N")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(1),
+            ) {
                 eprintln!("  vertex outputs {outs:?}");
                 for (k, v) in values.iter().enumerate() {
                     eprintln!("  [{k}] {v:?}");
@@ -142,8 +194,9 @@ fn main() {
                 eprintln!("  {name}: {:?}", v.first());
             }
         }
-        if let Some(p) = renderer.prepare(&queue, &draw) {
-            prepared.push(p);
+        match renderer.prepare(&queue, &draw) {
+            Some(p) => prepared.push(p),
+            None => eprintln!("emitter {j}: prepare failed"),
         }
     }
     let mut encoder = device.create_command_encoder(&Default::default());

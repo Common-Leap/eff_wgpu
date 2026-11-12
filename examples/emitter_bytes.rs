@@ -12,7 +12,7 @@ fn main() {
         .iter()
         .zip(&eff.entries)
         .filter(|(n, _)| n.to_lowercase().contains(&a[2].to_lowercase()))
-        .map(|(_, e)| e.emitter_set_id as usize)
+        .map(|(_, e)| e.emitter_set_id as usize - 1)
         .collect();
     for (i, s) in p.emitter_list.emitter_sets.iter().enumerate() {
         if !wanted.contains(&i) && !s.name.to_lowercase().contains(&a[2].to_lowercase()) {

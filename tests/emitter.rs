@@ -11,7 +11,7 @@ fn with_emitter<T>(emitter: usize, f: impl FnOnce(&mut sim::EmitterSim) -> T) ->
         .iter()
         .zip(&eff.entries)
         .find(|(n, _)| n.as_str() == "MARIO_FB_BULLET_R")
-        .map(|(_, e)| e.emitter_set_id as usize)
+        .map(|(_, e)| e.emitter_set_id as usize - 1)
         .unwrap();
     let p = eff.ptcl_file.as_ref().unwrap();
     let raw = &ptcl::emitter_sets(&p.base_bytes)[set].emitters[emitter];

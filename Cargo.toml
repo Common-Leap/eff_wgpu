@@ -9,6 +9,9 @@ license = "MIT"
 effect_library = "1.1.4"
 wgpu = "29.0.1"
 glam = "0.28.0"
+bntx = { git = "https://github.com/ScanMountGoat/bntx.git", rev = "87fffc7d17238cb07ff93ec75e0a7b5db15f4683" }
+image_dds = { version = "0.7", default-features = false }
+binrw = "0.15"
 
 [dev-dependencies]
 png = "0.17"
