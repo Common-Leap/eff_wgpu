@@ -187,3 +187,67 @@ fn ground_dust_spray_emits_over_its_duration_and_backward() {
         assert!(v[2] < 0.0, "particle thrown forward: {v:?}");
     }
 }
+
+/// The kill flags are the parsed emitter info's is_fade_emit, is_fade_alpha_fade and
+/// is_scale_fade at res+0x754..0x756, and a killed emitter stops emitting when the first is set.
+#[test]
+fn a_killed_emitter_stops_emitting_and_fades_as_its_flags_say() {
+    let Some(root) = std::env::var_os("VFX_GAME_EFFECTS") else {
+        eprintln!("VFX_GAME_EFFECTS not set; skipped");
+        return;
+    };
+    let data =
+        std::fs::read(std::path::Path::new(&root).join("system/common/ef_common.eff")).unwrap();
+    let eff = effect_library::namco_file::NamcoEffectFile::load(&data).unwrap();
+    let p = eff.ptcl_file.as_ref().unwrap();
+    let raws = ptcl::emitter_sets(&p.base_bytes);
+    let (mut checked, mut fading) = (0, 0);
+    for (set, parsed) in p.emitter_list.emitter_sets.iter().enumerate() {
+        for (index, emitter) in parsed.emitters.iter().enumerate() {
+            let raw = &raws[set].emitters[index];
+            let fixed = static_block::fixed_emitter_data(raw, &|_| None, None);
+            let info = &emitter.data.emitter_info;
+            assert_eq!(
+                (fixed[0x754] != 0, fixed[0x755] != 0, fixed[0x756] != 0),
+                (
+                    info.is_fade_emit != 0,
+                    info.is_fade_alpha_fade != 0,
+                    info.is_scale_fade != 0
+                ),
+                "set {set} emitter {index}"
+            );
+            checked += 1;
+            // An emitter that keeps emitting, stops when killed, and fades its alpha out.
+            if info.is_fade_emit != 0
+                && info.is_fade_alpha_fade != 0
+                && !emitter.data.emission.is_one_time
+                && emitter.data.emission.rate >= 1.0
+                && emitter.data.emission.start == 0
+                && i32::from_le_bytes(fixed[0x768..0x76c].try_into().unwrap()) >= 2
+                && fading == 0
+            {
+                fading += 1;
+                let mut s = sim::EmitterSim::new(&emitter.data, &fixed);
+                for _ in 0..5 {
+                    s.step();
+                }
+                assert!(s.count() > 0);
+                s.kill();
+                s.step();
+                let alpha = |s: &sim::EmitterSim| {
+                    let block =
+                        s.dynamic_block(&glam::Mat4::IDENTITY, &glam::Mat4::IDENTITY, [1.0; 4]);
+                    f32::from_le_bytes(block[0x30..0x34].try_into().unwrap())
+                };
+                assert!(alpha(&s) < 1.0, "fades after a kill");
+                for _ in 0..200 {
+                    s.step();
+                }
+                assert!(s.finished(), "gone once the fade runs out");
+                assert_eq!(s.count(), 0);
+            }
+        }
+    }
+    assert!(checked > 1000, "{checked}");
+    assert_eq!(fading, 1, "no fading emitter found to test");
+}

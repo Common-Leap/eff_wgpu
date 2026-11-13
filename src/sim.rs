@@ -91,6 +91,13 @@ pub struct EmitterSim<'a> {
     previous_translation: Option<Vec3>,
     /// Distance travelled and not yet emitted for (distance emission).
     distance: f32,
+    /// Set when the effect is killed (`EFFECT_OFF_KIND`; the game's fade request).
+    killed: bool,
+    /// Fade-out after a kill (emitter+0x70): 1 to 0 over res+0x768 frames when res+0x755
+    /// (alpha) or res+0x756 (scale) asks for it.
+    fade_out: f32,
+    /// The emitter is gone: its fade-out ran out (Calculate returned false).
+    finished: bool,
 }
 
 impl<'a> EmitterSim<'a> {
@@ -118,7 +125,23 @@ impl<'a> EmitterSim<'a> {
             current: local,
             previous_translation: None,
             distance: 0.0,
+            killed: false,
+            fade_out: 1.0,
+            finished: false,
         }
+    }
+
+    /// Kill the effect, as `EFFECT_OFF_KIND` does (EmitterCalculator::Calculate's fade path):
+    /// from the next step the emitter stops emitting if res+0x754 says so, and fades out over
+    /// res+0x768 frames if res+0x755 (alpha) or res+0x756 (scale) says so, then is gone.
+    /// Without either fade flag its particles live out their lives.
+    pub fn kill(&mut self) {
+        self.killed = true;
+    }
+
+    /// Whether the emitter is gone and draws nothing.
+    pub fn finished(&self) -> bool {
+        self.finished
     }
 
     /// The emitter's matrix (emitter+0x340, UpdateEmitterMatrix): the set's matrix times the
@@ -144,7 +167,11 @@ impl<'a> EmitterSim<'a> {
     }
 
     pub fn count(&self) -> usize {
-        self.particles.len()
+        if self.finished {
+            0
+        } else {
+            self.particles.len()
+        }
     }
 
     fn spawn(&mut self, count: usize) {
@@ -253,13 +280,36 @@ impl<'a> EmitterSim<'a> {
                 (self.fade_in + 1.0 / frames as f32).min(1.0)
             };
         }
+        let raw = self.raw;
+        let flag = |at: usize| raw.get(at).copied().unwrap_or(0) != 0;
+        let mut may_emit = true;
+        if self.killed && !self.finished {
+            may_emit = !flag(0x754);
+            if flag(0x755) || flag(0x756) {
+                let frames = i32_at(self.raw, 0x768);
+                self.fade_out = if frames < 1 {
+                    -1.0
+                } else {
+                    self.fade_out - 1.0 / frames as f32
+                };
+                if self.fade_out < 0.0 {
+                    self.fade_out = 0.0;
+                    self.finished = true;
+                    self.particles.clear();
+                }
+            }
+        }
+        if self.finished {
+            self.time += 1.0;
+            return;
+        }
         let frame = self.time;
         let emission = &self.data.emission;
         let start = emission.start as f32;
         // A one-time emitter emits at its rate, by the same timer as any other, for its duration
         // and then stops: sys_atk_smoke's impact3 (rate 1.5 for 3 frames) has 1, 3 and then 4
         // particles in game, read live from the emitter. Other emitters keep emitting.
-        let active = if emission.is_one_time {
+        let active = may_emit && if emission.is_one_time {
             frame >= start && frame < start + emission.duration.max(1) as f32
         } else {
             frame >= start
@@ -405,17 +455,15 @@ impl<'a> EmitterSim<'a> {
         // (captured: the game's fireball disc block reads (time, count, 0, 1)).
         v[10] = 0.0;
         v[11] = 1.0;
-        // Alpha and scale multipliers: the set's own (1 here) times the fade-in when the
-        // emitter asks for it. The fade-out on kill (emitter+0x70) is not modelled: it stays 1.
-        let fade = |flag: usize| {
-            if r.get(flag).copied().unwrap_or(0) != 0 {
-                self.fade_in
-            } else {
-                1.0
-            }
+        // MakeDynamicConstantBuffer: the fade-in where res+0x75b / 0x75c asks for it, times
+        // the fade-out after a kill where res+0x755 / 0x756 does.
+        let on = |flag: usize| r.get(flag).copied().unwrap_or(0) != 0;
+        let fade = |fade_in: usize, fade_out: usize| {
+            (if on(fade_in) { self.fade_in } else { 1.0 })
+                * (if on(fade_out) { self.fade_out } else { 1.0 })
         };
-        v[12] = fade(0x75b);
-        let scale = fade(0x75c);
+        v[12] = fade(0x75b, 0x755);
+        let scale = fade(0x75c, 0x756);
         v[13] = scale;
         v[14] = scale;
         v[15] = scale;
