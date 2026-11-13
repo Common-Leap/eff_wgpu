@@ -256,18 +256,18 @@ impl<'a> EmitterSim<'a> {
         let frame = self.time;
         let emission = &self.data.emission;
         let start = emission.start as f32;
-        let active = frame >= start
-            && (emission.duration == 0
-                || frame < start + emission.duration as f32
-                || emission.is_one_time);
+        // A one-time emitter emits at its rate, by the same timer as any other, for its duration
+        // and then stops: sys_atk_smoke's impact3 (rate 1.5 for 3 frames) has 1, 3 and then 4
+        // particles in game, read live from the emitter. Other emitters keep emitting.
+        let active = if emission.is_one_time {
+            frame >= start && frame < start + emission.duration.max(1) as f32
+        } else {
+            frame >= start
+                && (emission.duration == 0 || frame < start + emission.duration as f32)
+        };
         // Rate randomness and interval spread are integers in the file (res+0x804, +0x80c).
         let rate_random = i32_at(self.raw, 0x804) as f32 / 100.0;
-        if emission.is_one_time {
-            if frame == start {
-                let n = emission.rate * (1.0 - rate_random * self.rng.next());
-                self.spawn(n.max(0.0) as usize);
-            }
-        } else if active && self.raw.get(0x7f2).copied().unwrap_or(0) != 0 {
+        if active && self.raw.get(0x7f2).copied().unwrap_or(0) != 0 {
             self.emit_by_distance(moved, previous);
         } else if active {
             // Time emission (Smash 0x7c30, the res+0x7f2 == 0 branch).
@@ -468,13 +468,17 @@ fn spawn_shape(data: &EmitterData, rng: &mut Lcg, index: usize, count: usize) ->
     } else {
         std::f32::consts::TAU
     };
+    // The sweep is centred on its start angle: sys_atk_smoke's impact3 (start pi, sweep 163
+    // degrees) throws its particles backward to both sides in game, read live from the
+    // emitter, where a sweep starting at pi would throw half of them forward.
+    let first = shape.sweep_start - sweep * 0.5;
     let circle = |angle: f32, fill: f32| {
         let dir = Vec3::new(angle.sin(), 0.0, angle.cos());
         (dir * radius * fill, dir)
     };
     match shape.volume_type {
         1 | 3 => {
-            let angle = shape.sweep_start + rng.next() * sweep;
+            let angle = first + rng.next() * sweep;
             let fill = if shape.volume_type == 3 {
                 1.0 - shape.caliber_ratio * rng.next()
             } else {
@@ -483,7 +487,7 @@ fn spawn_shape(data: &EmitterData, rng: &mut Lcg, index: usize, count: usize) ->
             circle(angle, fill)
         }
         2 => circle(
-            shape.sweep_start + sweep * index as f32 / count.max(1) as f32,
+            first + sweep * index as f32 / count.max(1) as f32,
             1.0,
         ),
         4..=7 => {
@@ -496,7 +500,7 @@ fn spawn_shape(data: &EmitterData, rng: &mut Lcg, index: usize, count: usize) ->
             (dir * radius * fill, dir)
         }
         8 | 9 => {
-            let angle = shape.sweep_start + rng.next() * sweep;
+            let angle = first + rng.next() * sweep;
             let (mut position, dir) = circle(angle, 1.0);
             position.y = rng.signed() * radius.y;
             (position, dir)

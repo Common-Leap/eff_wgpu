@@ -145,3 +145,45 @@ fn bank_one_literals_match_a_captured_game_draw() {
         captured.as_slice()
     );
 }
+
+/// sys_atk_smoke's last emitter, impact3: one-time, rate 1.5 for 3 frames from frame 2, thrown
+/// from a 163 degree circle sweep centred on pi. Read live from the game (13.0.4, Mario's
+/// forward smash): 1, then 3, then 4 particles, every one moving backward (-z).
+#[test]
+fn ground_dust_spray_emits_over_its_duration_and_backward() {
+    let Some(root) = std::env::var_os("VFX_GAME_EFFECTS") else {
+        eprintln!("VFX_GAME_EFFECTS not set; skipped");
+        return;
+    };
+    let data =
+        std::fs::read(std::path::Path::new(&root).join("system/common/ef_common.eff")).unwrap();
+    let eff = effect_library::namco_file::NamcoEffectFile::load(&data).unwrap();
+    let set = eff
+        .entry_names
+        .iter()
+        .zip(&eff.entries)
+        .find(|(n, _)| n.eq_ignore_ascii_case("sys_atk_smoke"))
+        .map(|(_, e)| e.emitter_set_id as usize - 1)
+        .unwrap();
+    let p = eff.ptcl_file.as_ref().unwrap();
+    let index = p.emitter_list.emitter_sets[set]
+        .emitters
+        .iter()
+        .position(|e| e.data.name.as_deref() == Some("impact3"))
+        .unwrap();
+    let raw = &ptcl::emitter_sets(&p.base_bytes)[set].emitters[index];
+    let fixed = static_block::fixed_emitter_data(raw, &|_| None, None);
+    let parsed = &p.emitter_list.emitter_sets[set].emitters[index].data;
+    let mut s = sim::EmitterSim::new(parsed, &fixed);
+    let mut counts = Vec::new();
+    for _ in 0..6 {
+        s.step();
+        counts.push(s.count());
+    }
+    // The game's draw at emitter time T follows T + 1 updates.
+    assert_eq!(counts, [0, 0, 1, 3, 4, 4]);
+    let streams = s.streams();
+    for v in &streams["sysLocalVecAttr"] {
+        assert!(v[2] < 0.0, "particle thrown forward: {v:?}");
+    }
+}
