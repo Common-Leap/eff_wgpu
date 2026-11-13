@@ -38,7 +38,7 @@ fn frame_and_depth_reading_emitters_prepare_without_errors() {
             .unwrap(),
     )
     .unwrap();
-    let mut renderer = render::EffectRenderer::new(
+    let renderer = render::EffectRenderer::new(
         &device,
         &queue,
         &shaders,

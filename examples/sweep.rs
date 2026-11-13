@@ -67,7 +67,7 @@ fn main() {
             continue;
         };
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let mut renderer = render::EffectRenderer::new(&device, &queue, &shaders, format, None);
+            let renderer = render::EffectRenderer::new(&device, &queue, &shaders, format, None);
             let eye = Vec3::new(0.0, 10.0, 40.0);
             let rows = |m: Mat4| m.transpose().to_cols_array_2d();
             renderer.set_view(

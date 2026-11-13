@@ -59,7 +59,7 @@ fn mario_fireball_flame_quads_cover_pixels() {
             .unwrap(),
     )
     .unwrap();
-    let mut renderer = render::EffectRenderer::new(&device, &queue, &shaders, format, None);
+    let renderer = render::EffectRenderer::new(&device, &queue, &shaders, format, None);
     let eye = Vec3::new(0.0, 0.0, 25.0);
     let rows = |m: Mat4| m.transpose().to_cols_array_2d();
     let cam = Mat4::look_at_rh(eye, Vec3::ZERO, Vec3::Y);
@@ -130,6 +130,13 @@ fn mario_fireball_flame_quads_cover_pixels() {
         samplers: [Some(&smp), None, None],
         mesh: None,
     };
+    // Compiling happens on another thread while this one could keep drawing; once warmed,
+    // the emitter is ready and `prepare` has nothing left to compile.
+    assert!(!renderer.is_ready(draw.program, draw.state, false));
+    std::thread::scope(|scope| {
+        scope.spawn(|| renderer.warm(draw.program, draw.state, false));
+    });
+    assert!(renderer.is_ready(draw.program, draw.state, false));
     let prepared = renderer
         .prepare(&queue, &draw)
         .expect("the emitter prepares");

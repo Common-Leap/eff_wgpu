@@ -88,7 +88,7 @@ fn main() {
         view_formats: &[],
     });
     let view = target.create_view(&Default::default());
-    let mut renderer = render::EffectRenderer::new(&device, &queue, &shaders, format, None);
+    let renderer = render::EffectRenderer::new(&device, &queue, &shaders, format, None);
 
     // CAMERA="distance": look at the origin from +Z (the game's side view).
     let distance: f32 = std::env::var("CAMERA")

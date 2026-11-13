@@ -7,6 +7,7 @@
 //! static 9, dynamic 10, custom 16) and the emitter's textures at their sampler slots.
 
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use crate::bnsh::{Program, ShaderFile};
 use crate::maxwell::{decode::decode_program, wgsl};
@@ -196,11 +197,13 @@ pub struct EffectRenderer {
     target: wgpu::TextureFormat,
     depth: Option<wgpu::TextureFormat>,
     programs: Vec<Program>,
-    compiled: HashMap<usize, Result<Compiled, String>>,
+    /// The caches sit behind locks so a worker thread can compile ahead (`warm`) while the
+    /// paint thread draws what is ready. Compiling happens outside the locks.
+    compiled: Mutex<HashMap<usize, Result<Arc<Compiled>, String>>>,
     /// `None` for a pipeline wgpu rejected: that emitter is skipped rather than drawn.
-    pipelines: HashMap<(usize, RenderState, bool), Option<wgpu::RenderPipeline>>,
+    pipelines: Mutex<HashMap<PipelineKey, Option<wgpu::RenderPipeline>>>,
     /// Shader or pipeline errors caught since the last `take_failures`.
-    failures: Vec<String>,
+    failures: Mutex<Vec<String>>,
     group0: wgpu::BindGroupLayout,
     zero_bank: wgpu::Buffer,
     view_bank: wgpu::Buffer,
@@ -296,8 +299,8 @@ impl EffectRenderer {
             target,
             depth,
             programs: shaders.programs.clone(),
-            compiled: HashMap::new(),
-            pipelines: HashMap::new(),
+            compiled: Mutex::default(),
+            pipelines: Mutex::default(),
             group0,
             zero_bank: buffer("vfx zero bank", BANK_BYTES),
             view_bank: buffer("vfx view bank", BANK_BYTES),
@@ -306,14 +309,25 @@ impl EffectRenderer {
             background,
             scene_color: None,
             scene_depth: None,
-            failures: Vec::new(),
+            failures: Mutex::default(),
         }
     }
 
     /// Shader and pipeline errors caught since the last call. A rejected program is skipped,
     /// never fatal: wgpu's default handler aborts the whole app on a validation error.
-    pub fn take_failures(&mut self) -> Vec<String> {
-        std::mem::take(&mut self.failures)
+    pub fn take_failures(&self) -> Vec<String> {
+        std::mem::take(&mut *lock(&self.failures))
+    }
+
+    /// Whether `prepare` can draw this emitter without compiling anything first.
+    pub fn is_ready(&self, program: usize, state: RenderState, mesh: bool) -> bool {
+        lock(&self.pipelines).contains_key(&(program, state, mesh))
+    }
+
+    /// Compile a program and its pipeline now, so a later `prepare` does not stall on it.
+    /// Safe to call from another thread while this renderer draws.
+    pub fn warm(&self, program: usize, state: RenderState, mesh: bool) {
+        self.pipeline(program, state, mesh);
     }
 
     /// The colour shaders see as "the frame behind" when no scene copy is given.
@@ -351,27 +365,21 @@ impl EffectRenderer {
     }
 
     /// Why a program can't be drawn, if it can't.
-    pub fn program_error(&mut self, program: usize) -> Option<String> {
+    pub fn program_error(&self, program: usize) -> Option<String> {
         self.compile(program).err()
     }
 
     /// Run an emitter's vertex shader on the GPU as compute and read back what it outputs:
     /// for each of the first `instances` particles, 4 vertices of [position, varyings...].
     pub fn probe_vertex(
-        &mut self,
+        &self,
         queue: &wgpu::Queue,
         draw: &EmitterDraw,
         instances: u32,
     ) -> Option<(Vec<u32>, Vec<[f32; 4]>)> {
         use wgpu::util::DeviceExt;
         let prepared = self.prepare(queue, draw)?;
-        let c_group1 = self
-            .compiled
-            .get(&draw.program)?
-            .as_ref()
-            .ok()?
-            .group1
-            .clone();
+        let c_group1 = self.compile(draw.program).ok()?.group1.clone();
         let program = self.programs.get(draw.program)?;
         let vs = program.stages[crate::bnsh::STAGE_VERTEX].as_ref()?;
         let t = wgsl::translate(
@@ -479,9 +487,8 @@ impl EffectRenderer {
     }
 
     fn instance_bytes(&self, draw: &EmitterDraw, iface: &wgsl::Interface, count: u32) -> Vec<u8> {
-        let c = match self.compiled.get(&draw.program) {
-            Some(Ok(c)) => c,
-            _ => return Vec::new(),
+        let Ok(c) = self.compile(draw.program) else {
+            return Vec::new();
         };
         let by_location: HashMap<u32, &str> =
             c.locations.iter().map(|(n, l)| (*l, n.as_str())).collect();
@@ -500,25 +507,24 @@ impl EffectRenderer {
         out
     }
 
-    fn compile(&mut self, program: usize) -> Result<(), String> {
-        if !self.compiled.contains_key(&program) {
-            let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
-            let mut made = Self::compile_program(
-                &self.device,
-                self.programs.get(program),
-                !self.target.is_srgb(),
-            );
-            if let Some(error) = caught(scope) {
-                let message = format!("program {program}: {error}");
-                self.failures.push(message.clone());
-                made = Err(message);
-            }
-            self.compiled.insert(program, made);
+    fn compile(&self, program: usize) -> Result<Arc<Compiled>, String> {
+        if let Some(made) = lock(&self.compiled).get(&program) {
+            return made.clone();
         }
-        self.compiled[&program]
-            .as_ref()
-            .map(|_| ())
-            .map_err(Clone::clone)
+        let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let mut made = Self::compile_program(
+            &self.device,
+            self.programs.get(program),
+            !self.target.is_srgb(),
+        )
+        .map(Arc::new);
+        if let Some(error) = caught(scope) {
+            let message = format!("program {program}: {error}");
+            lock(&self.failures).push(message.clone());
+            made = Err(message);
+        }
+        // Another thread may have compiled it meanwhile; keep the first so both agree.
+        lock(&self.compiled).entry(program).or_insert(made).clone()
     }
 
     fn compile_program(
@@ -613,15 +619,17 @@ impl EffectRenderer {
     }
 
     fn pipeline(
-        &mut self,
+        &self,
         program: usize,
         state: RenderState,
         mesh: bool,
-    ) -> Option<&wgpu::RenderPipeline> {
-        self.compile(program).ok()?;
-        if !self.pipelines.contains_key(&(program, state, mesh)) {
+    ) -> Option<wgpu::RenderPipeline> {
+        let c = self.compile(program).ok()?;
+        if let Some(made) = lock(&self.pipelines).get(&(program, state, mesh)) {
+            return made.clone();
+        }
+        {
             let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
-            let c = self.compiled[&program].as_ref().ok()?;
             let layout = self
                 .device
                 .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -631,7 +639,7 @@ impl EffectRenderer {
                 });
             // Slot 0: the mesh's four vertex inputs (64 bytes a vertex). Slot 1: every particle
             // stream interleaved, one vec4 each in input order.
-            let (per_vertex, per_instance) = Self::split_inputs(c, mesh);
+            let (per_vertex, per_instance) = Self::split_inputs(&c, mesh);
             let vertex_attributes: Vec<wgpu::VertexAttribute> = per_vertex
                 .iter()
                 .map(|(loc, slot)| wgpu::VertexAttribute {
@@ -730,28 +738,28 @@ impl EffectRenderer {
                 });
             let pipeline = match caught(scope) {
                 Some(error) => {
-                    self.failures
-                        .push(format!("program {program} pipeline: {error}"));
+                    lock(&self.failures).push(format!("program {program} pipeline: {error}"));
                     None
                 }
                 None => Some(pipeline),
             };
-            self.pipelines.insert((program, state, mesh), pipeline);
+            lock(&self.pipelines)
+                .entry((program, state, mesh))
+                .or_insert(pipeline)
+                .clone()
         }
-        self.pipelines.get(&(program, state, mesh))?.as_ref()
     }
 
     /// Upload one emitter's data and record its draw. Buffers live in the returned frame data,
     /// which must outlive the render pass.
-    pub fn prepare(&mut self, queue: &wgpu::Queue, draw: &EmitterDraw) -> Option<PreparedDraw> {
+    pub fn prepare(&self, queue: &wgpu::Queue, draw: &EmitterDraw) -> Option<PreparedDraw> {
         let count = draw.count.min(MAX_INSTANCES as u32);
         if count == 0 {
             return None;
         }
         let mesh = draw.mesh.is_some();
-        self.pipeline(draw.program, draw.state, mesh)?;
-        let pipeline = self.pipelines[&(draw.program, draw.state, mesh)].clone()?;
-        let c = self.compiled[&draw.program].as_ref().ok()?;
+        let pipeline = self.pipeline(draw.program, draw.state, mesh)?;
+        let c = self.compile(draw.program).ok()?;
         let make = |label: &str, bytes: &[u8], usage: wgpu::BufferUsages, size: u64| {
             let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some(label),
@@ -824,7 +832,7 @@ impl EffectRenderer {
         });
         let by_location: HashMap<u32, &str> =
             c.locations.iter().map(|(n, l)| (*l, n.as_str())).collect();
-        let (_, inputs) = Self::split_inputs(c, mesh);
+        let (_, inputs) = Self::split_inputs(&c, mesh);
         let mut interleaved: Vec<[f32; 4]> = Vec::with_capacity(count as usize * inputs.len());
         for i in 0..count as usize {
             for loc in &inputs {
@@ -1029,6 +1037,12 @@ pub fn make_sampler(
 
 /// The error an error scope caught. On native wgpu the scope's future is ready as soon as it is
 /// popped, so it is polled once here rather than awaited.
+type PipelineKey = (usize, RenderState, bool);
+
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 fn caught(scope: wgpu::ErrorScopeGuard) -> Option<wgpu::Error> {
     let mut future = std::pin::pin!(scope.pop());
     let mut context = std::task::Context::from_waker(std::task::Waker::noop());
