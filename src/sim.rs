@@ -59,6 +59,9 @@ fn f32_at(b: &[u8], at: usize) -> f32 {
         .unwrap_or(0.0)
 }
 
+/// Live particles one emitter keeps, the most the renderer draws in one call.
+pub const MAX_PARTICLES: usize = 4096;
+
 /// One emitter running in the effect's space.
 pub struct EmitterSim<'a> {
     data: &'a EmitterData,
@@ -123,6 +126,9 @@ impl<'a> EmitterSim<'a> {
     }
 
     fn spawn(&mut self, count: usize) {
+        // The renderer draws at most this many; a rate past it (or a corrupt one) must not
+        // grow the particle list without bound.
+        let count = count.min(MAX_PARTICLES.saturating_sub(self.particles.len()));
         let data = self.data;
         let velocity = &data.particle_velocity;
         for index in 0..count {

@@ -9,7 +9,10 @@ use effect_library::ptcl_file::PtclFile;
 pub struct Texture {
     pub width: u32,
     pub height: u32,
-    /// Mip 0 first; each level is width*height*4 bytes at its own size.
+    /// Array layers (1 for most; pattern-animation textures keep one frame per layer).
+    pub layers: u32,
+    /// Mip 0 first; each level holds every layer in turn, each width*height*4 bytes at that
+    /// level's size.
     pub mips: Vec<Vec<u8>>,
 }
 
@@ -40,15 +43,17 @@ pub fn decode(ptcl: &PtclFile, index: usize) -> Option<Texture> {
     let bntx = bntx::Bntx::read_le(&mut std::io::Cursor::new(single)).ok()?;
     let surface = bntx.to_surface().ok()?.decode_rgba8().ok()?;
     let sel = comp_sel(pool, index).unwrap_or([2, 3, 4, 5]);
-    let (width, height) = (surface.width, surface.height);
+    let (width, height, layers) = (surface.width, surface.height, surface.layers.max(1));
     let mut mips = Vec::new();
-    for level in 0..surface.mipmaps {
+    'levels: for level in 0..surface.mipmaps {
         let (w, h) = ((width >> level).max(1), (height >> level).max(1));
-        let Some(data) = surface.get(0, 0, level) else {
-            break;
-        };
-        let mut out = data.to_vec();
-        out.truncate((w * h * 4) as usize);
+        let mut out = Vec::with_capacity((w * h * 4 * layers) as usize);
+        for layer in 0..layers {
+            let Some(data) = surface.get(layer, 0, level) else {
+                break 'levels;
+            };
+            out.extend_from_slice(&data[..((w * h * 4) as usize).min(data.len())]);
+        }
         for px in out.chunks_exact_mut(4) {
             let src = [px[0], px[1], px[2], px[3]];
             for (c, s) in sel.iter().enumerate() {
@@ -65,6 +70,7 @@ pub fn decode(ptcl: &PtclFile, index: usize) -> Option<Texture> {
     (!mips.is_empty()).then_some(Texture {
         width,
         height,
+        layers,
         mips,
     })
 }

@@ -113,7 +113,7 @@ pub struct EmitterDraw<'a> {
     pub streams: &'a HashMap<&'static str, Vec<[f32; 4]>>,
     pub count: u32,
     /// Texture for each sampler slot the emitter uses.
-    pub textures: [Option<&'a wgpu::TextureView>; 3],
+    pub textures: [Option<&'a GpuTexture>; 3],
     pub samplers: [Option<&'a wgpu::Sampler>; 3],
     /// The emitter's mesh primitive, when it draws one instead of a quad.
     pub mesh: Option<&'a crate::mesh::Mesh>,
@@ -136,6 +136,57 @@ struct Compiled {
     locations: HashMap<String, u32>,
     vs_literals: wgpu::Buffer,
     fs_literals: wgpu::Buffer,
+    /// Texture bindings in the dimensions this program's shaders declare.
+    group1: wgpu::BindGroupLayout,
+    arrays: [bool; SLOTS as usize],
+}
+
+/// A texture on the GPU, viewed both as a plain 2D image (its first layer) and as an array, so
+/// it can be bound to whichever a shader declares.
+pub struct GpuTexture {
+    pub flat: wgpu::TextureView,
+    pub array: wgpu::TextureView,
+}
+
+impl GpuTexture {
+    fn view(&self, array: bool) -> &wgpu::TextureView {
+        if array {
+            &self.array
+        } else {
+            &self.flat
+        }
+    }
+}
+
+/// The texture layout for a program: 2D or 2D-array per slot, as its stages declare.
+fn texture_layout(device: &wgpu::Device, arrays: &[bool; SLOTS as usize]) -> wgpu::BindGroupLayout {
+    let mut entries = Vec::new();
+    for s in 0..SLOTS {
+        entries.push(wgpu::BindGroupLayoutEntry {
+            binding: s * 2,
+            visibility: wgpu::ShaderStages::VERTEX_FRAGMENT | wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                view_dimension: if arrays[s as usize] {
+                    wgpu::TextureViewDimension::D2Array
+                } else {
+                    wgpu::TextureViewDimension::D2
+                },
+                multisampled: false,
+            },
+            count: None,
+        });
+        entries.push(wgpu::BindGroupLayoutEntry {
+            binding: s * 2 + 1,
+            visibility: wgpu::ShaderStages::VERTEX_FRAGMENT | wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+            count: None,
+        });
+    }
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("vfx textures"),
+        entries: &entries,
+    })
 }
 
 pub struct EffectRenderer {
@@ -144,20 +195,33 @@ pub struct EffectRenderer {
     depth: Option<wgpu::TextureFormat>,
     programs: Vec<Program>,
     compiled: HashMap<usize, Result<Compiled, String>>,
-    pipelines: HashMap<(usize, RenderState, bool), wgpu::RenderPipeline>,
+    /// `None` for a pipeline wgpu rejected: that emitter is skipped rather than drawn.
+    pipelines: HashMap<(usize, RenderState, bool), Option<wgpu::RenderPipeline>>,
+    /// Shader or pipeline errors caught since the last `take_failures`.
+    failures: Vec<String>,
     group0: wgpu::BindGroupLayout,
-    group1: wgpu::BindGroupLayout,
     zero_bank: wgpu::Buffer,
     view_bank: wgpu::Buffer,
-    blank: wgpu::TextureView,
+    blank: GpuTexture,
     blank_sampler: wgpu::Sampler,
+    /// What the pixel shaders read as the frame drawn so far (sysFrameBufferTexture, slot 3)
+    /// and its depth (sysDepthBufferTexture, slot 4). Without a scene copy the frame is the
+    /// background colour and the depth is 1.0, "nothing behind": soft particles draw in full.
+    background: wgpu::Texture,
+    scene_color: Option<wgpu::TextureView>,
+    scene_depth: Option<wgpu::TextureView>,
 }
 
 /// Banks every pipeline layout declares (a program that does not read one simply ignores it).
 /// Bindings every pipeline layout declares: vertex literals (1), pixel literals (3), view (8),
 /// static (9), dynamic (10), plugin (12), reserved custom (13), custom 0 (14), custom 2 (16).
 const BANKS: [u8; 9] = [1, 3, 8, 9, 10, 12, 13, 14, 16];
-const SLOTS: u32 = 3;
+/// Texture slots: the emitter's three samplers, then the frame copy (3) and depth (4) the game
+/// binds for every draw. A layout without the last two fails pipeline creation for the 2,900
+/// shader stages that read them, and wgpu treats that as fatal.
+const SLOTS: u32 = 5;
+const SLOT_FRAME: usize = 3;
+const SLOT_DEPTH: usize = 4;
 const MAX_INSTANCES: u64 = 4096;
 
 impl EffectRenderer {
@@ -184,29 +248,6 @@ impl EffectRenderer {
                 })
                 .collect::<Vec<_>>(),
         });
-        let mut entries = Vec::new();
-        for s in 0..SLOTS {
-            entries.push(wgpu::BindGroupLayoutEntry {
-                binding: s * 2,
-                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT | wgpu::ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::Texture {
-                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                    view_dimension: wgpu::TextureViewDimension::D2,
-                    multisampled: false,
-                },
-                count: None,
-            });
-            entries.push(wgpu::BindGroupLayoutEntry {
-                binding: s * 2 + 1,
-                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT | wgpu::ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                count: None,
-            });
-        }
-        let group1 = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("vfx textures"),
-            entries: &entries,
-        });
         let buffer = |label, size| {
             device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some(label),
@@ -218,27 +259,35 @@ impl EffectRenderer {
             })
         };
         use wgpu::util::DeviceExt;
-        let blank = device
-            .create_texture_with_data(
-                queue,
-                &wgpu::TextureDescriptor {
-                    label: Some("vfx blank"),
-                    size: wgpu::Extent3d {
-                        width: 1,
-                        height: 1,
-                        depth_or_array_layers: 1,
-                    },
-                    mip_level_count: 1,
-                    sample_count: 1,
-                    dimension: wgpu::TextureDimension::D2,
-                    format: wgpu::TextureFormat::Rgba8Unorm,
-                    usage: wgpu::TextureUsages::TEXTURE_BINDING,
-                    view_formats: &[],
+        let blank = upload_texture(
+            device,
+            queue,
+            &crate::texture::Texture {
+                width: 1,
+                height: 1,
+                layers: 1,
+                mips: vec![vec![255, 255, 255, 255]],
+            },
+        );
+        let background = device.create_texture_with_data(
+            queue,
+            &wgpu::TextureDescriptor {
+                label: Some("vfx background"),
+                size: wgpu::Extent3d {
+                    width: 1,
+                    height: 1,
+                    depth_or_array_layers: 1,
                 },
-                wgpu::util::TextureDataOrder::LayerMajor,
-                &[255, 255, 255, 255],
-            )
-            .create_view(&wgpu::TextureViewDescriptor::default());
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            },
+            wgpu::util::TextureDataOrder::LayerMajor,
+            &[0, 0, 0, 255],
+        );
         Self {
             device: device.clone(),
             target,
@@ -247,12 +296,50 @@ impl EffectRenderer {
             compiled: HashMap::new(),
             pipelines: HashMap::new(),
             group0,
-            group1,
             zero_bank: buffer("vfx zero bank", BANK_BYTES),
             view_bank: buffer("vfx view bank", BANK_BYTES),
             blank,
             blank_sampler: device.create_sampler(&wgpu::SamplerDescriptor::default()),
+            background,
+            scene_color: None,
+            scene_depth: None,
+            failures: Vec::new(),
         }
+    }
+
+    /// Shader and pipeline errors caught since the last call. A rejected program is skipped,
+    /// never fatal: wgpu's default handler aborts the whole app on a validation error.
+    pub fn take_failures(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.failures)
+    }
+
+    /// The colour shaders see as "the frame behind" when no scene copy is given.
+    pub fn set_background(&self, queue: &wgpu::Queue, rgba: [u8; 4]) {
+        queue.write_texture(
+            self.background.as_image_copy(),
+            &rgba,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(4),
+                rows_per_image: None,
+            },
+            wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+        );
+    }
+
+    /// A copy of the frame drawn so far and its depth (as 0..1 in a float texture), for
+    /// refraction and soft-particle shaders. `None` falls back to the background and to 1.0.
+    pub fn set_scene(
+        &mut self,
+        color: Option<wgpu::TextureView>,
+        depth: Option<wgpu::TextureView>,
+    ) {
+        self.scene_color = color;
+        self.scene_depth = depth;
     }
 
     /// The camera block (see `view_block`), shared by every emitter this frame.
@@ -275,6 +362,13 @@ impl EffectRenderer {
     ) -> Option<(Vec<u32>, Vec<[f32; 4]>)> {
         use wgpu::util::DeviceExt;
         let prepared = self.prepare(queue, draw)?;
+        let c_group1 = self
+            .compiled
+            .get(&draw.program)?
+            .as_ref()
+            .ok()?
+            .group1
+            .clone();
         let program = self.programs.get(draw.program)?;
         let vs = program.stages[crate::bnsh::STAGE_VERTEX].as_ref()?;
         let t = wgsl::translate(
@@ -308,7 +402,7 @@ impl EffectRenderer {
             .device
             .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: None,
-                bind_group_layouts: &[Some(&self.group0), Some(&self.group1), Some(&group2)],
+                bind_group_layouts: &[Some(&self.group0), Some(&c_group1), Some(&group2)],
                 immediate_size: 0,
             });
         let pipeline = self
@@ -405,7 +499,13 @@ impl EffectRenderer {
 
     fn compile(&mut self, program: usize) -> Result<(), String> {
         if !self.compiled.contains_key(&program) {
-            let made = Self::compile_program(&self.device, self.programs.get(program));
+            let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
+            let mut made = Self::compile_program(&self.device, self.programs.get(program));
+            if let Some(error) = caught(scope) {
+                let message = format!("program {program}: {error}");
+                self.failures.push(message.clone());
+                made = Err(message);
+            }
             self.compiled.insert(program, made);
         }
         self.compiled[&program]
@@ -445,6 +545,17 @@ impl EffectRenderer {
                 usage: wgpu::BufferUsages::UNIFORM,
             })
         };
+        let mut arrays = [false; SLOTS as usize];
+        for (slot, dim) in v
+            .interface
+            .textures
+            .iter()
+            .chain(f.interface.textures.iter())
+        {
+            if let Some(a) = arrays.get_mut(*slot as usize) {
+                *a |= *dim == wgsl::TexDim::Array2D;
+            }
+        }
         Ok(Compiled {
             vs_literals: literals(vs.literals()),
             fs_literals: literals(fs.literals()),
@@ -457,6 +568,8 @@ impl EffectRenderer {
                 .filter(|b| b.slot >= 0)
                 .map(|b| (b.name.clone(), b.slot as u32))
                 .collect(),
+            group1: texture_layout(device, &arrays),
+            arrays,
             vs: v.interface,
             fs: f.interface,
         })
@@ -488,12 +601,13 @@ impl EffectRenderer {
     ) -> Option<&wgpu::RenderPipeline> {
         self.compile(program).ok()?;
         if !self.pipelines.contains_key(&(program, state, mesh)) {
+            let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
             let c = self.compiled[&program].as_ref().ok()?;
             let layout = self
                 .device
                 .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                     label: Some("vfx"),
-                    bind_group_layouts: &[Some(&self.group0), Some(&self.group1)],
+                    bind_group_layouts: &[Some(&self.group0), Some(&c.group1)],
                     immediate_size: 0,
                 });
             // Slot 0: the mesh's four vertex inputs (64 bytes a vertex). Slot 1: every particle
@@ -595,9 +709,17 @@ impl EffectRenderer {
                     multiview_mask: None,
                     cache: None,
                 });
+            let pipeline = match caught(scope) {
+                Some(error) => {
+                    self.failures
+                        .push(format!("program {program} pipeline: {error}"));
+                    None
+                }
+                None => Some(pipeline),
+            };
             self.pipelines.insert((program, state, mesh), pipeline);
         }
-        self.pipelines.get(&(program, state, mesh))
+        self.pipelines.get(&(program, state, mesh))?.as_ref()
     }
 
     /// Upload one emitter's data and record its draw. Buffers live in the returned frame data,
@@ -609,7 +731,7 @@ impl EffectRenderer {
         }
         let mesh = draw.mesh.is_some();
         self.pipeline(draw.program, draw.state, mesh)?;
-        let pipeline = self.pipelines[&(draw.program, draw.state, mesh)].clone();
+        let pipeline = self.pipelines[&(draw.program, draw.state, mesh)].clone()?;
         let c = self.compiled[&draw.program].as_ref().ok()?;
         let make = |label: &str, bytes: &[u8], usage: wgpu::BufferUsages, size: u64| {
             let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
@@ -654,23 +776,31 @@ impl EffectRenderer {
                 .collect::<Vec<_>>(),
         });
         let mut entries = Vec::new();
+        let background = self.background.create_view(&Default::default());
         for s in 0..SLOTS as usize {
+            let view = match s {
+                SLOT_FRAME => self.scene_color.as_ref().unwrap_or(&background),
+                SLOT_DEPTH => self.scene_depth.as_ref().unwrap_or(&self.blank.flat),
+                _ => draw.textures[s].unwrap_or(&self.blank).view(c.arrays[s]),
+            };
+            let sampler = draw
+                .samplers
+                .get(s)
+                .copied()
+                .flatten()
+                .unwrap_or(&self.blank_sampler);
             entries.push(wgpu::BindGroupEntry {
                 binding: s as u32 * 2,
-                resource: wgpu::BindingResource::TextureView(
-                    draw.textures[s].unwrap_or(&self.blank),
-                ),
+                resource: wgpu::BindingResource::TextureView(view),
             });
             entries.push(wgpu::BindGroupEntry {
                 binding: s as u32 * 2 + 1,
-                resource: wgpu::BindingResource::Sampler(
-                    draw.samplers[s].unwrap_or(&self.blank_sampler),
-                ),
+                resource: wgpu::BindingResource::Sampler(sampler),
             });
         }
         let group1 = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("vfx textures"),
-            layout: &self.group1,
+            layout: &c.group1,
             entries: &entries,
         });
         let by_location: HashMap<u32, &str> =
@@ -807,7 +937,7 @@ pub fn upload_texture(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     texture: &crate::texture::Texture,
-) -> wgpu::TextureView {
+) -> GpuTexture {
     use wgpu::util::DeviceExt;
     let data: Vec<u8> = texture.mips.iter().flatten().copied().collect();
     let gpu = device.create_texture_with_data(
@@ -817,7 +947,7 @@ pub fn upload_texture(
             size: wgpu::Extent3d {
                 width: texture.width,
                 height: texture.height,
-                depth_or_array_layers: 1,
+                depth_or_array_layers: texture.layers.max(1),
             },
             mip_level_count: texture.mips.len() as u32,
             sample_count: 1,
@@ -829,7 +959,17 @@ pub fn upload_texture(
         wgpu::util::TextureDataOrder::MipMajor,
         &data,
     );
-    gpu.create_view(&Default::default())
+    GpuTexture {
+        flat: gpu.create_view(&wgpu::TextureViewDescriptor {
+            dimension: Some(wgpu::TextureViewDimension::D2),
+            array_layer_count: Some(1),
+            ..Default::default()
+        }),
+        array: gpu.create_view(&wgpu::TextureViewDescriptor {
+            dimension: Some(wgpu::TextureViewDimension::D2Array),
+            ..Default::default()
+        }),
+    }
 }
 
 /// A sampler as nn::vfx's TextureSampler::Initialize builds it: wrap 0 mirror, 1 repeat,
@@ -862,4 +1002,15 @@ pub fn make_sampler(
         lod_max_clamp: max_lod.clamp(0.0, 32.0),
         ..Default::default()
     })
+}
+
+/// The error an error scope caught. On native wgpu the scope's future is ready as soon as it is
+/// popped, so it is polled once here rather than awaited.
+fn caught(scope: wgpu::ErrorScopeGuard) -> Option<wgpu::Error> {
+    let mut future = std::pin::pin!(scope.pop());
+    let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+    match std::future::Future::poll(future.as_mut(), &mut context) {
+        std::task::Poll::Ready(error) => error,
+        std::task::Poll::Pending => None,
+    }
 }
