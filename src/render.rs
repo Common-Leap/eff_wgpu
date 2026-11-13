@@ -935,16 +935,16 @@ impl MaxLen for Vec<u8> {
     }
 }
 
-/// Smash's sysCustomShaderUniformBlock2 (0x50 bytes) as its effect manager sets it up
-/// (main 0x260ab0c on v0): row 0 x is the draw's multiplier (1), rows 0-1 otherwise carry stage
-/// lighting, row 1 z is -1 (set per draw at 0x2600fxx; directional particles cross their motion
-/// with -z times the eye vector), row 2 is (1, 0, 1, 0), row 3 per-set data (0), row 4
-/// (1, -99999, 1, 0).
+/// Smash's sysCustomShaderUniformBlock2 (0x50 bytes) as read from the game's GPU memory in a
+/// capture of a training-stage frame (13.0.4, Ryujinx + RenderDoc): every effect draw in the
+/// frame bound this one block. Row 0 x is a global colour scale: the game writes 0.5 and draws
+/// into a buffer its post pass scales back up; this preview has no post pass, so it writes the
+/// equivalent 1.0. Rows 1-4 are the captured values.
 pub fn default_custom2() -> Vec<u8> {
     let rows: [f32; 20] = [
         1.0, 0.0, 0.0, 0.0, //
-        0.0, 0.0, -1.0, 0.0, //
-        1.0, 0.0, 1.0, 0.0, //
+        1.0, 1.0, 1.0, 1.0, //
+        1.0, 0.0, 1.0, -1.0, //
         0.0, 0.0, 0.0, 0.0, //
         1.0, -99999.0, 1.0, 0.0,
     ];
