@@ -46,7 +46,7 @@ pub struct Interface {
 pub struct Translation {
     pub source: String,
     pub interface: Interface,
-    /// False when a pixel shader branches: its implicit-LOD samples then read mip 0.
+    /// False when a pixel shader branches (it still samples with implicit LOD, see `module`).
     pub uniform_control_flow: bool,
 }
 
@@ -1285,6 +1285,15 @@ impl Translator {
 
     fn module(&self, body: &str, structured: bool) -> String {
         let mut m = String::new();
+        // A pixel shader that branches is run here as a dispatch loop, which WGSL cannot prove
+        // uniform, so implicit-LOD samples and derivatives would be rejected there. The game's
+        // GPU takes them anyway (Maxwell computes derivatives per quad), so allow them: without
+        // this every branching pixel shader sampled mip 0 and shimmered when minified.
+        let derivatives = self.kind == StageKind::Fragment;
+        if derivatives {
+            m.push_str("diagnostic(off, derivative_uniformity);\n");
+        }
+        let _ = structured;
         for bank in &self.iface.banks {
             let _ = writeln!(
                 m,
@@ -1309,7 +1318,7 @@ impl Translator {
                 TexDim::D3 | TexDim::Cube => "vec3<f32>",
                 _ => "vec2<f32>",
             };
-            let implicit = if self.kind == StageKind::Fragment && structured {
+            let implicit = if derivatives {
                 format!("textureSample(tex{slot}, smp{slot}, uv)")
             } else {
                 format!("textureSampleLevel(tex{slot}, smp{slot}, uv, 0.0)")
@@ -1321,7 +1330,7 @@ impl Translator {
                 );
             }
             if *dim == TexDim::D2 {
-                let lod = if self.kind == StageKind::Fragment && structured {
+                let lod = if derivatives {
                     format!("let size = vec2<f32>(textureDimensions(tex{slot}));\n    let dx = dpdx(uv) * size;\n    let dy = dpdy(uv) * size;\n    return max(0.5 * log2(max(dot(dx, dx), dot(dy, dy))), 0.0);")
                 } else {
                     "return 0.0;".to_string()
