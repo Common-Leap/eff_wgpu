@@ -196,6 +196,8 @@ pub struct EffectRenderer {
     device: wgpu::Device,
     target: wgpu::TextureFormat,
     depth: Option<wgpu::TextureFormat>,
+    /// Samples per pixel of the target (and depth) this draws into.
+    samples: u32,
     programs: Vec<Program>,
     /// The caches sit behind locks so a worker thread can compile ahead (`warm`) while the
     /// paint thread draws what is ready. Compiling happens outside the locks.
@@ -298,6 +300,7 @@ impl EffectRenderer {
             device: device.clone(),
             target,
             depth,
+            samples: 1,
             programs: shaders.programs.clone(),
             compiled: Mutex::default(),
             pipelines: Mutex::default(),
@@ -311,6 +314,13 @@ impl EffectRenderer {
             scene_depth: None,
             failures: Mutex::default(),
         }
+    }
+
+    /// Draw into a multisampled target with this many samples (and depth with as many).
+    /// Set it before the first draw: pipelines are built for it.
+    pub fn with_sample_count(mut self, samples: u32) -> Self {
+        self.samples = samples.max(1);
+        self
     }
 
     /// Shader and pipeline errors caught since the last call. A rejected program is skipped,
@@ -515,7 +525,7 @@ impl EffectRenderer {
         let mut made = Self::compile_program(
             &self.device,
             self.programs.get(program),
-            !self.target.is_srgb(),
+            encodes_srgb(self.target),
         )
         .map(Arc::new);
         if let Some(error) = caught(scope) {
@@ -722,7 +732,10 @@ impl EffectRenderer {
                         stencil: Default::default(),
                         bias: Default::default(),
                     }),
-                    multisample: Default::default(),
+                    multisample: wgpu::MultisampleState {
+                        count: self.samples,
+                        ..Default::default()
+                    },
                     fragment: Some(wgpu::FragmentState {
                         module: &c.fragment,
                         entry_point: Some("main"),
@@ -946,17 +959,36 @@ impl MaxLen for Vec<u8> {
 /// Smash's sysCustomShaderUniformBlock2 (0x50 bytes) as read from the game's GPU memory in a
 /// capture of a training-stage frame (13.0.4, Ryujinx + RenderDoc): every effect draw in the
 /// frame bound this one block. Row 0 x is a global colour scale: the game writes 0.5 and draws
-/// into a buffer its post pass scales back up; this preview has no post pass, so it writes the
-/// equivalent 1.0. Rows 1-4 are the captured values.
+/// into a buffer its post pass scales back up (x1.3703 in gamma space, x2 linear). Use
+/// [game_custom2] when drawing into a scene that gets that post pass; this block's 1.0 is the
+/// equivalent for a target shown as is. Rows 1-4 are the captured values.
 pub fn default_custom2() -> Vec<u8> {
+    custom2_with_scale(1.0)
+}
+
+/// [default_custom2] exactly as the game binds it, with the 0.5 scale its post pass undoes.
+pub fn game_custom2() -> Vec<u8> {
+    custom2_with_scale(0.5)
+}
+
+fn custom2_with_scale(scale: f32) -> Vec<u8> {
     let rows: [f32; 20] = [
-        1.0, 0.0, 0.0, 0.0, //
+        scale, 0.0, 0.0, 0.0, //
         1.0, 1.0, 1.0, 1.0, //
         1.0, 0.0, 1.0, -1.0, //
         0.0, 0.0, 0.0, 0.0, //
         1.0, -99999.0, 1.0, 0.0,
     ];
     rows.iter().flat_map(|v| v.to_le_bytes()).collect()
+}
+
+/// Whether shaders must encode their output to sRGB themselves: for 8-bit targets shown as
+/// they are. Float and 10-bit targets hold linear values like the game's own scene buffer.
+fn encodes_srgb(target: wgpu::TextureFormat) -> bool {
+    matches!(
+        target,
+        wgpu::TextureFormat::Rgba8Unorm | wgpu::TextureFormat::Bgra8Unorm
+    )
 }
 
 /// A decoded texture on the GPU with all its mip levels.
