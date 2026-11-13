@@ -108,3 +108,40 @@ fn distance_emission_follows_the_path_the_emitter_moved() {
     // 3.0 a frame: one per frame plus the carried remainder, six in all.
     assert_eq!(counts(3.0), 6);
 }
+
+#[test]
+fn bank_one_literals_match_a_captured_game_draw() {
+    let Some(root) = std::env::var_os("VFX_GAME_EFFECTS") else {
+        eprintln!("VFX_GAME_EFFECTS not set; skipped");
+        return;
+    };
+    let data =
+        std::fs::read(std::path::Path::new(&root).join("fighter/mario/ef_mario.eff")).unwrap();
+    let eff = effect_library::namco_file::NamcoEffectFile::load(&data).unwrap();
+    let bin = eff
+        .ptcl_file
+        .unwrap()
+        .shader_info
+        .unwrap()
+        .binary_data
+        .unwrap();
+    let file = vfx_runtime::bnsh::ShaderFile::read(&bin).unwrap();
+    // Program 6 is the fireball disc ciecle3; the game bound these 32 bytes as its vertex bank 1.
+    let captured: Vec<u8> = [
+        1.0f32.to_bits(),
+        1 << 19,
+        1 << 20,
+        1 << 21,
+        1 << 22,
+        1 << 23,
+        1 << 24,
+        (-0.5f32).to_bits(),
+    ]
+    .iter()
+    .flat_map(|w| w.to_le_bytes())
+    .collect();
+    assert_eq!(
+        file.programs[6].stages[0].as_ref().unwrap().literals(),
+        captured.as_slice()
+    );
+}

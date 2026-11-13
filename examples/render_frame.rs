@@ -39,13 +39,45 @@ fn main() {
     let (device, queue) =
         pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).unwrap();
     device.on_uncaptured_error(std::sync::Arc::new(|e: wgpu::Error| eprintln!("wgpu: {e}")));
-    let format = wgpu::TextureFormat::Rgba8Unorm;
-    let size = 512;
+    let format = wgpu::TextureFormat::Rgba8UnormSrgb;
+    // SIZE=WxH (width a multiple of 64); BG=r,g,b (0-255, sRGB); VIEW_FILE=raw 0x140-byte camera
+    // block; SET_ROWS=16 floats, the set matrix's rows.
+    let (width, height): (u32, u32) = std::env::var("SIZE")
+        .ok()
+        .and_then(|v| {
+            let (w, h) = v.split_once('x')?;
+            Some((w.parse().ok()?, h.parse().ok()?))
+        })
+        .unwrap_or((512, 512));
+    let set_matrix = std::env::var("SET_ROWS")
+        .ok()
+        .map(|v| {
+            let f: Vec<f32> = v.split_whitespace().map(|x| x.parse().unwrap()).collect();
+            Mat4::from_cols_array(&f.try_into().unwrap()).transpose()
+        })
+        .unwrap_or(Mat4::IDENTITY);
+    let bg: [f64; 3] = std::env::var("BG")
+        .ok()
+        .map(|v| {
+            let f: Vec<f64> = v
+                .split(',')
+                .map(|x| x.parse::<f64>().unwrap() / 255.0)
+                .collect();
+            [f[0], f[1], f[2]]
+        })
+        .unwrap_or([0.25, 0.25, 0.3]);
+    let lin = |c: f64| {
+        if c <= 0.04045 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
+    };
     let target = device.create_texture(&wgpu::TextureDescriptor {
         label: None,
         size: wgpu::Extent3d {
-            width: size,
-            height: size,
+            width,
+            height,
             depth_or_array_layers: 1,
         },
         mip_level_count: 1,
@@ -67,10 +99,14 @@ fn main() {
     let cam = Mat4::look_at_rh(eye, Vec3::ZERO, Vec3::Y);
     let proj = Mat4::perspective_rh(45f32.to_radians(), 1.0, 1.0, 1000.0);
     let rows = |m: Mat4| m.transpose().to_cols_array_2d();
-    renderer.set_view(
-        &queue,
-        &view_block::view_block(&rows(cam), &rows(proj), eye.into(), 1.0, 1000.0, 1.0),
-    );
+    if let Ok(path) = std::env::var("VIEW_FILE") {
+        renderer.set_view(&queue, &std::fs::read(path).unwrap());
+    } else {
+        renderer.set_view(
+            &queue,
+            &view_block::view_block(&rows(cam), &rows(proj), eye.into(), 1.0, 1000.0, 1.0),
+        );
+    }
 
     let mut fixed = Vec::new();
     for (j, e) in parsed.emitters.iter().enumerate() {
@@ -120,9 +156,9 @@ fn main() {
             .flatten();
         let mut s = sim::EmitterSim::new(&e.data, fixed_data);
         for _ in 0..frame {
-            s.step();
+            s.step_at(&set_matrix);
         }
-        let srt = s.emitter_srt(&Mat4::IDENTITY);
+        let srt = s.emitter_srt(&set_matrix);
         let mut streams = s.streams();
         // PROBE_VERTEX="x,y,u,v,alpha": one mesh vertex's inputs, for probing mesh programs.
         if let Ok(v) = std::env::var("PROBE_RANDOM") {
@@ -138,7 +174,12 @@ fn main() {
             streams.insert("sysNormalAttr", vec![[0.0, 0.0, 1.0, 0.0]; n]);
             streams.insert("sysVertexColor0Attr", vec![[1.0, 1.0, 1.0, f[4]]; n]);
         }
-        let dynamic = s.dynamic_block(&srt, &s.emitter_rt(&Mat4::IDENTITY), [1.0; 4]);
+        let (_, rot, pos) = set_matrix.to_scale_rotation_translation();
+        let dynamic = s.dynamic_block(
+            &srt,
+            &s.emitter_rt(&Mat4::from_rotation_translation(rot, pos)),
+            [1.0; 4],
+        );
         let statics = static_block::static_block(fixed_data);
         let rs = &e.data.render_state;
         let program = e.data.shader_references.shader_index as usize;
@@ -147,7 +188,11 @@ fn main() {
             continue;
         }
         let custom = static_block::custom_block(raw);
-        let custom2 = render::default_custom2();
+        let mut custom2 = render::default_custom2();
+        // CUSTOM2_X0: the colour scale in row 0 x (the game binds 0.5).
+        if let Ok(v) = std::env::var("CUSTOM2_X0") {
+            custom2[0..4].copy_from_slice(&v.parse::<f32>().unwrap().to_le_bytes());
+        }
         let draw = render::EmitterDraw {
             program,
             state: render::RenderState {
@@ -209,9 +254,9 @@ fn main() {
                 depth_slice: None,
                 ops: wgpu::Operations {
                     load: wgpu::LoadOp::Clear(wgpu::Color {
-                        r: 0.25,
-                        g: 0.25,
-                        b: 0.3,
+                        r: lin(bg[0]),
+                        g: lin(bg[1]),
+                        b: lin(bg[2]),
                         a: 1.0,
                     }),
                     store: wgpu::StoreOp::Store,
@@ -225,7 +270,7 @@ fn main() {
     }
     let readback = device.create_buffer(&wgpu::BufferDescriptor {
         label: None,
-        size: (size * size * 4) as u64,
+        size: (width * height * 4) as u64,
         usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
         mapped_at_creation: false,
     });
@@ -235,13 +280,13 @@ fn main() {
             buffer: &readback,
             layout: wgpu::TexelCopyBufferLayout {
                 offset: 0,
-                bytes_per_row: Some(size * 4),
+                bytes_per_row: Some(width * 4),
                 rows_per_image: None,
             },
         },
         wgpu::Extent3d {
-            width: size,
-            height: size,
+            width,
+            height,
             depth_or_array_layers: 1,
         },
     );
@@ -250,7 +295,7 @@ fn main() {
     device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
     let pixels = readback.slice(..).get_mapped_range().to_vec();
     let file = std::fs::File::create(out).unwrap();
-    let mut enc = png::Encoder::new(file, size, size);
+    let mut enc = png::Encoder::new(file, width, height);
     enc.set_color(png::ColorType::Rgba);
     enc.write_header()
         .unwrap()

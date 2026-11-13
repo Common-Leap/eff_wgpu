@@ -45,6 +45,8 @@ pub struct Stage {
     /// NVN's control section for the stage (it carries the program's constant bank 1).
     pub control: Vec<u8>,
     pub reflection: Reflection,
+    /// Bytes of NVN prefix removed from the front of `code` (0 or 0x30).
+    pub prefix: usize,
 }
 
 impl Stage {
@@ -57,8 +59,14 @@ impl Stage {
                 .map(|b| u32::from_le_bytes(b.try_into().unwrap()) as usize)
                 .unwrap_or(0)
         };
-        let (offset, size) = (word(0x6f8), word(0x6fc));
-        self.code.get(offset..offset + size).unwrap_or_default()
+        // The block's offset (control +0x700) counts from the stage's start including the NVN
+        // prefix this reader strips; its size is at +0x6fc. Checked against the bank-1 buffer a
+        // captured game draw bound (Mario's fireball disc: 1.0, 1<<19 .. 1<<24, -0.5).
+        let (offset, size) = (word(0x700), word(0x6fc));
+        offset
+            .checked_sub(self.prefix)
+            .and_then(|at| self.code.get(at..at + size))
+            .unwrap_or_default()
     }
 }
 
@@ -156,9 +164,11 @@ fn read_program(r: &Reader, variation: usize) -> Result<Program, Error> {
         let code_offset = r.u64(code_at + 16)? as usize;
         let code_size = r.u32(code_at + 24)? as usize;
         let mut code = r.bytes(code_offset, code_size)?;
+        let mut prefix = 0;
         // Some programs carry a 0x30-byte prefix (it starts 0x12345678) ahead of the header.
         if code.len() > 0x30 && !looks_like_sph(code) && looks_like_sph(&code[0x30..]) {
             code = &code[0x30..];
+            prefix = 0x30;
         }
         let reflection = if reflection_table != 0 {
             let refl_at = r.u64(reflection_table + stage * 8)? as usize;
@@ -174,6 +184,7 @@ fn read_program(r: &Reader, variation: usize) -> Result<Program, Error> {
             code: code.to_vec(),
             control,
             reflection,
+            prefix,
         });
     }
     Ok(program)
