@@ -79,9 +79,11 @@ impl Blend {
         };
         Some(wgpu::BlendState {
             color: colour,
+            // nn::vfx leaves the target's alpha as it was (ZERO, DST_ALPHA; seen in a capture
+            // of the game's fireball draw).
             alpha: BlendComponent {
-                src_factor: F::One,
-                dst_factor: F::OneMinusSrcAlpha,
+                src_factor: F::Zero,
+                dst_factor: F::DstAlpha,
                 operation: Op::Add,
             },
         })

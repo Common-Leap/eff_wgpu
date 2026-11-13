@@ -121,6 +121,16 @@ impl<'a> EmitterSim<'a> {
         *set_rt * self.local_rt
     }
 
+    /// Spawn `count` particles with the generator at `seed`, as the game's InitializeParticle
+    /// does at emitter time `time`, and return the generator state afterwards. For checking the
+    /// spawn port against generator states read from the running game.
+    pub fn spawn_from_seed(&mut self, seed: u32, time: f32, count: usize) -> u32 {
+        self.rng = Lcg(seed);
+        self.time = time;
+        self.spawn(count);
+        self.rng.0
+    }
+
     pub fn count(&self) -> usize {
         self.particles.len()
     }
