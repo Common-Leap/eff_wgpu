@@ -116,7 +116,7 @@ fn main() {
                                 continue;
                             }
                             let srt = s.emitter_srt(&Mat4::IDENTITY);
-                            let streams = s.streams(&srt);
+                            let streams = s.streams();
                             let dynamic =
                                 s.dynamic_block(&srt, &s.emitter_rt(&Mat4::IDENTITY), [1.0; 4]);
                             let statics = static_block::static_block(&fixed);

@@ -62,3 +62,49 @@ fn mario_fireball_disc_is_turned_by_its_own_rotation() {
     let m = with_emitter(0, |s| s.emitter_srt(&glam::Mat4::IDENTITY));
     assert!((m.transform_vector3(glam::Vec3::X) - glam::Vec3::X).length() < 1e-6);
 }
+
+#[test]
+fn dynamic_block_row_two_matches_a_captured_game_draw() {
+    if std::env::var_os("VFX_GAME_EFFECTS").is_none() {
+        eprintln!("VFX_GAME_EFFECTS not set; skipped");
+        return;
+    }
+    // The game's block for the fireball's ciecle1 disc, captured at emitter time 8 (Ryujinx +
+    // RenderDoc): row 2 is (time, particle count, 0, 1).
+    let row = with_emitter(2, |s| {
+        for _ in 0..9 {
+            s.step();
+        }
+        let block = s.dynamic_block(&glam::Mat4::IDENTITY, &glam::Mat4::IDENTITY, [1.0; 4]);
+        let f = |at: usize| f32::from_le_bytes(block[at..at + 4].try_into().unwrap());
+        [f(0x20), f(0x24), f(0x28), f(0x2c)]
+    });
+    assert_eq!(row, [8.0, 1.0, 0.0, 1.0]);
+}
+
+#[test]
+fn distance_emission_follows_the_path_the_emitter_moved() {
+    if std::env::var_os("VFX_GAME_EFFECTS").is_none() {
+        eprintln!("VFX_GAME_EFFECTS not set; skipped");
+        return;
+    }
+    // fire1 (emitter 0): distance emission, one particle every 2.0 units, frames 2-5.
+    let counts = |speed: f32| {
+        with_emitter(0, |s| {
+            for frame in 0..8 {
+                s.step_at(&glam::Mat4::from_translation(glam::Vec3::new(
+                    speed * frame as f32,
+                    0.0,
+                    0.0,
+                )));
+            }
+            s.count()
+        })
+    };
+    // Standing still emits nothing, as in the game.
+    assert_eq!(counts(0.0), 0);
+    // 1.4 a frame over frames 2-5: 1.4, 2.8 (one, 0.8 left), 2.2 (one, 0.2 left), 1.6.
+    assert_eq!(counts(1.4), 2);
+    // 3.0 a frame: one per frame plus the carried remainder, six in all.
+    assert_eq!(counts(3.0), 6);
+}

@@ -78,8 +78,13 @@ fn mario_fireball_flame_quads_cover_pixels() {
     );
     let fixed = static_block::fixed_emitter_data(raw, &|_| None, None);
     let mut s = sim::EmitterSim::new(parsed, &fixed);
-    for _ in 0..6 {
-        s.step();
+    // fire1 emits by distance: move the set the way the fireball flies (1.4 a frame).
+    for frame in 0..6 {
+        s.step_at(&Mat4::from_translation(Vec3::new(
+            1.4 * frame as f32,
+            0.0,
+            0.0,
+        )));
     }
     assert!(s.count() > 0);
     let ids: Vec<u64> = p
@@ -101,7 +106,7 @@ fn mario_fireball_flame_quads_cover_pixels() {
         sampler.max_lod,
     );
     let srt = s.emitter_srt(&Mat4::IDENTITY);
-    let streams = s.streams(&srt);
+    let streams = s.streams();
     let dynamic = s.dynamic_block(&srt, &s.emitter_rt(&Mat4::IDENTITY), [1.0; 4]);
     let statics = static_block::static_block(&fixed);
     let custom2 = render::default_custom2();

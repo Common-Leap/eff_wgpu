@@ -123,7 +123,7 @@ fn main() {
             s.step();
         }
         let srt = s.emitter_srt(&Mat4::IDENTITY);
-        let mut streams = s.streams(&srt);
+        let mut streams = s.streams();
         // PROBE_VERTEX="x,y,u,v,alpha": one mesh vertex's inputs, for probing mesh programs.
         if let Ok(v) = std::env::var("PROBE_RANDOM") {
             let f: Vec<f32> = v.split(',').map(|x| x.parse().unwrap()).collect();

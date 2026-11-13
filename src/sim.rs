@@ -45,6 +45,9 @@ struct Live {
     scale: [f32; 4],
     random: [f32; 4],
     rotate: [f32; 4],
+    /// The emitter's matrix when this particle was born (EmtMat0-2): the shader places
+    /// particles that do not follow the emitter with it.
+    birth_matrix: Mat4,
 }
 
 fn i32_at(b: &[u8], at: usize) -> i32 {
@@ -82,6 +85,12 @@ pub struct EmitterSim<'a> {
     interval: f32,
     accumulated: f32,
     particles: Vec<Live>,
+    /// The emitter's matrix this frame (emitter+0x340) and its translation last frame
+    /// (emitter+0x3c0), for distance emission and birth matrices.
+    current: Mat4,
+    previous_translation: Option<Vec3>,
+    /// Distance travelled and not yet emitted for (distance emission).
+    distance: f32,
 }
 
 impl<'a> EmitterSim<'a> {
@@ -102,10 +111,13 @@ impl<'a> EmitterSim<'a> {
             } else {
                 1.0
             },
-            timer: f32::MAX,
+            timer: 0.0,
             interval: 0.0,
             accumulated: 0.0,
             particles: Vec::new(),
+            current: local,
+            previous_translation: None,
+            distance: 0.0,
         }
     }
 
@@ -213,12 +225,26 @@ impl<'a> EmitterSim<'a> {
                     f32_at(self.raw, 0x328),
                     0.0,
                 ],
+                birth_matrix: self.current,
             });
         }
     }
 
-    /// One frame: emission, then motion; the emitter time advances by one.
+    /// One frame with the set where it was: emission, then motion; time advances by one.
     pub fn step(&mut self) {
+        self.step_at(&Mat4::IDENTITY);
+    }
+
+    /// One frame with the set's matrix for this frame (EmitterCalculator::Calculate). A set
+    /// that moves between frames is what distance emission measures, and each new particle
+    /// keeps the matrix it was born with.
+    pub fn step_at(&mut self, set: &Mat4) {
+        self.current = *set * self.local;
+        let translation = self.current.w_axis.truncate();
+        let moved = self
+            .previous_translation
+            .map_or(Vec3::ZERO, |previous| translation - previous);
+        let previous = self.previous_translation.unwrap_or(translation);
         if self.fade_in < 1.0 {
             let frames = i32_at(self.raw, 0x76c);
             self.fade_in = if frames < 1 {
@@ -234,29 +260,36 @@ impl<'a> EmitterSim<'a> {
             && (emission.duration == 0
                 || frame < start + emission.duration as f32
                 || emission.is_one_time);
+        // Rate randomness and interval spread are integers in the file (res+0x804, +0x80c).
+        let rate_random = i32_at(self.raw, 0x804) as f32 / 100.0;
         if emission.is_one_time {
             if frame == start {
-                let n = emission.rate * (1.0 - emission.rate_random / 100.0 * self.rng.next());
+                let n = emission.rate * (1.0 - rate_random * self.rng.next());
                 self.spawn(n.max(0.0) as usize);
             }
+        } else if active && self.raw.get(0x7f2).copied().unwrap_or(0) != 0 {
+            self.emit_by_distance(moved, previous);
         } else if active {
+            // Time emission (Smash 0x7c30, the res+0x7f2 == 0 branch).
             if self.timer >= self.interval {
-                let rate = emission.rate * (1.0 + emission.rate_random / 100.0 * self.rng.next());
+                let r = self.rng.next();
+                let rate = emission.rate + emission.rate * rate_random * r;
                 self.accumulated = (self.accumulated + rate).max(0.0);
-                let n = self.accumulated.floor();
-                if n > 0.0 {
-                    self.spawn(n as usize);
-                    self.accumulated -= n;
+                let n = self.accumulated as i32;
+                if n == 0 {
                     self.timer = 0.0;
-                    let jitter = emission.interval_random * self.rng.next();
-                    self.interval = (emission.interval as f32 + jitter).max(0.0);
                 } else {
-                    self.timer = 0.0;
+                    let interval = self.interval;
+                    self.spawn(n as usize);
+                    self.interval = self.next_interval();
+                    self.accumulated -= n as f32;
+                    self.timer = (self.timer - interval) + 1.0;
                 }
             } else {
                 self.timer += 1.0;
             }
         }
+        self.previous_translation = Some(translation);
         let statics = &self.data.emitter_static;
         let gravity = Vec3::new(
             statics.gravity_dir_x,
@@ -277,11 +310,52 @@ impl<'a> EmitterSim<'a> {
         self.particles.retain(|p| now - p.birth < p.life);
     }
 
+    /// The next emission interval after an emission (Smash 0x30e0): res+0x808 frames plus one
+    /// plus a random whole number below res+0x80c.
+    fn next_interval(&mut self) -> f32 {
+        let spread = i32_at(self.raw, 0x80c).max(0) as u64;
+        let draw = ((self.rng.0 as u64 * spread) >> 32) as f32;
+        self.rng.next();
+        i32_at(self.raw, 0x808) as f32 + 1.0 + draw
+    }
+
+    /// Distance emission (Smash 0x7c30, the res+0x7f2 branch): the distance the emitter moved
+    /// this frame (zero under the margin res+0x830, else clamped to res+0x828..res+0x82c) adds
+    /// to a running total, and every res+0x824 of it is one particle, placed along the path
+    /// from last frame's position to this one.
+    fn emit_by_distance(&mut self, moved: Vec3, previous: Vec3) {
+        let length = moved.length();
+        let margin = f32_at(self.raw, 0x830);
+        let raw_step = if length >= margin { length } else { 0.0 };
+        let (min, max) = (f32_at(self.raw, 0x828), f32_at(self.raw, 0x82c));
+        let step = if raw_step != 0.0 && (raw_step < min || raw_step > max) {
+            raw_step.clamp(min, max)
+        } else {
+            raw_step
+        };
+        let unit = f32_at(self.raw, 0x824);
+        let mut total = self.distance + step;
+        if unit != 0.0 {
+            let n = (total / unit) as i32;
+            let current = self.current;
+            let here = current.w_axis.truncate();
+            for _ in 0..n.max(0) {
+                total -= unit;
+                let t = if step == 0.0 { 0.0 } else { total / step };
+                let at = here + (previous - here) * t;
+                self.current.w_axis = at.extend(1.0);
+                self.spawn(1);
+            }
+            self.current = current;
+        }
+        self.distance = total;
+    }
+
     /// The per-particle streams the shaders read, by attribute name.
-    pub fn streams(&self, emitter_matrix: &Mat4) -> HashMap<&'static str, Vec<[f32; 4]>> {
+    pub fn streams(&self) -> HashMap<&'static str, Vec<[f32; 4]>> {
         let mut out: HashMap<&'static str, Vec<[f32; 4]>> = HashMap::new();
-        let rows = emitter_matrix.transpose().to_cols_array_2d();
         for p in &self.particles {
+            let rows = p.birth_matrix.transpose().to_cols_array_2d();
             out.entry("sysLocalPosAttr").or_default().push([
                 p.position.x,
                 p.position.y,
@@ -327,7 +401,9 @@ impl<'a> EmitterSim<'a> {
         // (live capture: time 4 with fade 5/6). `self.time` counts steps taken, one ahead.
         v[8] = (self.time - 1.0).max(0.0);
         v[9] = self.particles.len() as f32;
-        v[10] = 1.0;
+        // MakeDynamicConstantBuffer's param_2 and frame step: 0 and 1 for an ordinary draw
+        // (captured: the game's fireball disc block reads (time, count, 0, 1)).
+        v[10] = 0.0;
         v[11] = 1.0;
         // Alpha and scale multipliers: the set's own (1 here) times the fade-in when the
         // emitter asks for it. The fade-out on kill (emitter+0x70) is not modelled: it stays 1.
