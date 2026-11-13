@@ -11,6 +11,8 @@ pub struct Texture {
     pub height: u32,
     /// Array layers (1 for most; pattern-animation textures keep one frame per layer).
     pub layers: u32,
+    /// Stored as sRGB: the GPU converts these to linear when sampling (BC1/2/3/7 Srgb).
+    pub srgb: bool,
     /// Mip 0 first; each level holds every layer in turn, each width*height*4 bytes at that
     /// level's size.
     pub mips: Vec<Vec<u8>>,
@@ -41,7 +43,9 @@ pub fn decode(ptcl: &PtclFile, index: usize) -> Option<Texture> {
     let name = &info.descriptors.get(index)?.name;
     let single = effect_library::bntx::build_single_texture_bntx_public(pool, index, name).ok()?;
     let bntx = bntx::Bntx::read_le(&mut std::io::Cursor::new(single)).ok()?;
-    let surface = bntx.to_surface().ok()?.decode_rgba8().ok()?;
+    let stored = bntx.to_surface().ok()?;
+    let srgb = format!("{:?}", stored.image_format).contains("Srgb");
+    let surface = stored.decode_rgba8().ok()?;
     let sel = comp_sel(pool, index).unwrap_or([2, 3, 4, 5]);
     let (width, height, layers) = (surface.width, surface.height, surface.layers.max(1));
     let mut mips = Vec::new();
@@ -71,6 +75,7 @@ pub fn decode(ptcl: &PtclFile, index: usize) -> Option<Texture> {
         width,
         height,
         layers,
+        srgb,
         mips,
     })
 }

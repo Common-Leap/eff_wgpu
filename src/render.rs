@@ -266,6 +266,7 @@ impl EffectRenderer {
                 width: 1,
                 height: 1,
                 layers: 1,
+                srgb: false,
                 mips: vec![vec![255, 255, 255, 255]],
             },
         );
@@ -500,7 +501,11 @@ impl EffectRenderer {
     fn compile(&mut self, program: usize) -> Result<(), String> {
         if !self.compiled.contains_key(&program) {
             let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
-            let mut made = Self::compile_program(&self.device, self.programs.get(program));
+            let mut made = Self::compile_program(
+                &self.device,
+                self.programs.get(program),
+                !self.target.is_srgb(),
+            );
             if let Some(error) = caught(scope) {
                 let message = format!("program {program}: {error}");
                 self.failures.push(message.clone());
@@ -517,6 +522,7 @@ impl EffectRenderer {
     fn compile_program(
         device: &wgpu::Device,
         program: Option<&Program>,
+        encode_output: bool,
     ) -> Result<Compiled, String> {
         let program = program.ok_or("no such shader program")?;
         let vs = program.stages[crate::bnsh::STAGE_VERTEX]
@@ -527,7 +533,18 @@ impl EffectRenderer {
             .ok_or("no pixel stage")?;
         let body = |code: &[u8]| decode_program(code.get(0x50..).unwrap_or_default());
         let v = wgsl::translate(wgsl::StageKind::Vertex, &body(&vs.code))?;
-        let f = wgsl::translate(wgsl::StageKind::Fragment, &body(&fs.code))?;
+        let mut f = wgsl::translate(wgsl::StageKind::Fragment, &body(&fs.code))?;
+        if encode_output {
+            // The shaders compute linear colour (sRGB textures arrive linear, constants are
+            // linear); the game's frame is encoded to sRGB on the way to the screen. A target
+            // that is not an sRGB format gets that encoding here. Blending then happens on
+            // encoded values, where the game blends linear ones.
+            f.source = f.source.replace(
+                "return run();",
+                "let c = run(); return vec4<f32>(srgb_encode(c.rgb), c.a);",
+            );
+            f.source.push_str(SRGB_ENCODE);
+        }
         let module = |label, source: &str| {
             device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some(label),
@@ -952,7 +969,11 @@ pub fn upload_texture(
             mip_level_count: texture.mips.len() as u32,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
+            format: if texture.srgb {
+                wgpu::TextureFormat::Rgba8UnormSrgb
+            } else {
+                wgpu::TextureFormat::Rgba8Unorm
+            },
             usage: wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
         },
@@ -1014,3 +1035,11 @@ fn caught(scope: wgpu::ErrorScopeGuard) -> Option<wgpu::Error> {
         std::task::Poll::Pending => None,
     }
 }
+
+/// Linear to sRGB, per channel, for targets that do not encode on write.
+const SRGB_ENCODE: &str = "
+fn srgb_encode(c: vec3<f32>) -> vec3<f32> {
+    let l = max(c, vec3<f32>(0.0));
+    return select(1.055 * pow(l, vec3<f32>(1.0 / 2.4)) - 0.055, 12.92 * l, l <= vec3<f32>(0.0031308));
+}
+";
