@@ -362,8 +362,12 @@ impl<'a> EmitterSim<'a> {
             particle.velocity += gravity;
         }
         self.time += 1.0;
+        // A particle draws `life` times, the frame it is born included: the game ages and
+        // removes particles before it emits, so a new one always reaches the screen (live
+        // probe: sys_attack_arc_b's arccylinder1, life 1, draws once; arccylinder2, life 3,
+        // three times). The draw after this step reads time `now - 1`.
         let now = self.time;
-        self.particles.retain(|p| now - p.birth < p.life);
+        self.particles.retain(|p| now - 1.0 - p.birth < p.life);
     }
 
     /// The next emission interval after an emission (Smash 0x30e0): res+0x808 frames plus one

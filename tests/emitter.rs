@@ -279,3 +279,46 @@ fn the_particle_scale_carries_the_set_scale() {
     // Unscaled, as before.
     assert_eq!(particle_scale(6, 0, 1.0), [1.0; 3]);
 }
+
+/// Particle counts per step for one emitter of the shared file's sys_attack_arc_b.
+fn arc_b_counts(emitter: &str, steps: usize) -> Vec<usize> {
+    let root = std::path::PathBuf::from(std::env::var_os("VFX_GAME_EFFECTS").unwrap());
+    let data = std::fs::read(root.join("system/common/ef_common.eff")).unwrap();
+    let eff = effect_library::namco_file::NamcoEffectFile::load(&data).unwrap();
+    let set = eff
+        .entry_names
+        .iter()
+        .zip(&eff.entries)
+        .find(|(n, _)| n.as_str() == "SYS_ATTACK_ARC_B")
+        .map(|(_, e)| e.emitter_set_id as usize - 1)
+        .unwrap();
+    let p = eff.ptcl_file.as_ref().unwrap();
+    let index = p.emitter_list.emitter_sets[set]
+        .emitters
+        .iter()
+        .position(|e| e.data.name.as_deref() == Some(emitter))
+        .unwrap();
+    let raw = &ptcl::emitter_sets(&p.base_bytes)[set].emitters[index];
+    let fixed = static_block::fixed_emitter_data(raw, &|_| None, None);
+    let parsed = &p.emitter_list.emitter_sets[set].emitters[index].data;
+    let mut s = sim::EmitterSim::new(parsed, &fixed);
+    (0..steps)
+        .map(|_| {
+            s.step();
+            s.count()
+        })
+        .collect()
+}
+
+#[test]
+fn a_particle_draws_on_the_frame_it_is_born_and_for_its_whole_life() {
+    if std::env::var_os("VFX_GAME_EFFECTS").is_none() {
+        eprintln!("VFX_GAME_EFFECTS not set; skipped");
+        return;
+    }
+    // Live probe, Dark Samus's up tilt: arccylinder1 (life 1) draws at emitter time 0 only,
+    // arccylinder2 (life 3, from time 1) at times 1, 2 and 3. The draw after step n reads
+    // time n - 1.
+    assert_eq!(arc_b_counts("arccylinder1", 3), vec![1, 0, 0]);
+    assert_eq!(arc_b_counts("arccylinder2", 5), vec![0, 1, 1, 1, 0]);
+}
