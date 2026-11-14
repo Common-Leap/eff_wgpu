@@ -17,6 +17,10 @@ pub const BANK_VIEW: u8 = 8;
 pub const BANK_STATIC: u8 = 9;
 pub const BANK_DYNAMIC: u8 = 10;
 pub const BANK_CUSTOM0: u8 = 14;
+/// sysCustomShaderReservedUniformBlockParam (slot 10): the emitter's custom shader parameters.
+/// 64 programs of the shared file read their colour modulation from it (sys_crown's crowns);
+/// left as zeros, they drew black.
+pub const BANK_CUSTOM_PARAM: u8 = 13;
 pub const BANK_CUSTOM2: u8 = 16;
 
 const BANK_BYTES: u64 = wgsl::CBUF_ROWS as u64 * 16;
@@ -108,7 +112,8 @@ pub struct EmitterDraw<'a> {
     pub state: RenderState,
     pub static_block: &'a [u8],
     pub dynamic_block: &'a [u8],
-    /// sysCustomShaderUniformBlock0 (the emitter's custom shader data).
+    /// The emitter's custom shader data (its CSDP attribute), bound as
+    /// sysCustomShaderReservedUniformBlockParam and sysCustomShaderUniformBlock0.
     pub custom0_block: Option<&'a [u8]>,
     /// sysCustomShaderUniformBlock2: the game's per-draw block (0x50 bytes).
     pub custom2_block: Option<&'a [u8]>,
@@ -799,7 +804,7 @@ impl EffectRenderer {
                 BANK_VIEW => &self.view_bank,
                 BANK_STATIC => &statics,
                 BANK_DYNAMIC => &dynamic,
-                BANK_CUSTOM0 => custom0.as_ref().unwrap_or(&self.zero_bank),
+                BANK_CUSTOM0 | BANK_CUSTOM_PARAM => custom0.as_ref().unwrap_or(&self.zero_bank),
                 BANK_CUSTOM2 => custom2.as_ref().unwrap_or(&self.zero_bank),
                 _ => &self.zero_bank,
             }
