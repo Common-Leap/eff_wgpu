@@ -163,6 +163,7 @@ fn main() {
                                 static_block: &statics,
                                 dynamic_block: &dynamic,
                                 custom0_block: custom0.as_deref(),
+                                user_block: None,
                                 custom2_block: Some(&custom2),
                                 streams: &streams,
                                 count: s.count() as u32,

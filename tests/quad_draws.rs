@@ -123,6 +123,7 @@ fn mario_fireball_flame_quads_cover_pixels() {
         static_block: &statics,
         dynamic_block: &dynamic,
         custom0_block: None,
+        user_block: None,
         custom2_block: Some(&custom2),
         streams: &streams,
         count: s.count() as u32,

@@ -113,8 +113,12 @@ pub struct EmitterDraw<'a> {
     pub static_block: &'a [u8],
     pub dynamic_block: &'a [u8],
     /// The emitter's custom shader data (its CSDP attribute), bound as
-    /// sysCustomShaderReservedUniformBlockParam and sysCustomShaderUniformBlock0.
+    /// sysCustomShaderReservedUniformBlockParam, and as sysCustomShaderUniformBlock0 unless
+    /// `user_block` gives that one.
     pub custom0_block: Option<&'a [u8]>,
+    /// sysCustomShaderUniformBlock0 as the game fills it for this draw, where it does: Inkling's
+    /// ink shaders read her ink colour from it (row 0 multiplies the colour, row 1 is added).
+    pub user_block: Option<&'a [u8]>,
     /// sysCustomShaderUniformBlock2: the game's per-draw block (0x50 bytes).
     pub custom2_block: Option<&'a [u8]>,
     /// Per-particle streams by attribute name (`sysLocalPosAttr`, ...), one vec4 per particle.
@@ -794,6 +798,9 @@ impl EffectRenderer {
         let custom0 = draw
             .custom0_block
             .map(|b| make("vfx custom0", b, uniform, BANK_BYTES));
+        let user = draw
+            .user_block
+            .map(|b| make("vfx user block", b, uniform, BANK_BYTES));
         let custom2 = draw
             .custom2_block
             .map(|b| make("vfx custom2", b, uniform, BANK_BYTES));
@@ -804,7 +811,11 @@ impl EffectRenderer {
                 BANK_VIEW => &self.view_bank,
                 BANK_STATIC => &statics,
                 BANK_DYNAMIC => &dynamic,
-                BANK_CUSTOM0 | BANK_CUSTOM_PARAM => custom0.as_ref().unwrap_or(&self.zero_bank),
+                BANK_CUSTOM0 => user
+                    .as_ref()
+                    .or(custom0.as_ref())
+                    .unwrap_or(&self.zero_bank),
+                BANK_CUSTOM_PARAM => custom0.as_ref().unwrap_or(&self.zero_bank),
                 BANK_CUSTOM2 => custom2.as_ref().unwrap_or(&self.zero_bank),
                 _ => &self.zero_bank,
             }

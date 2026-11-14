@@ -90,6 +90,7 @@ fn frame_and_depth_reading_emitters_prepare_without_errors() {
                     static_block: &statics,
                     dynamic_block: &dynamic,
                     custom0_block: None,
+                    user_block: None,
                     custom2_block: Some(&custom2),
                     streams: &streams,
                     count: s.count() as u32,

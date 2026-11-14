@@ -93,6 +93,9 @@ pub struct EmitterSim<'a> {
     /// passes it to the shaders as the particle scale, beside the fade (live probe: Dark Samus's
     /// up tilt arc, scale 1.65 at her 0.96, reads 1.584 there).
     set_scale: Vec3,
+    /// The particle colour a script sets on the effect (`LAST_PARTICLE_SET_COLOR`), which the
+    /// shaders read per particle; white unless set.
+    particle_colour: [f32; 4],
     /// Distance travelled and not yet emitted for (distance emission).
     distance: f32,
     /// Set when the effect is killed (`EFFECT_OFF_KIND`; the game's fade request).
@@ -129,6 +132,7 @@ impl<'a> EmitterSim<'a> {
             current: local,
             previous_translation: None,
             set_scale: Vec3::ONE,
+            particle_colour: [1.0; 4],
             distance: 0.0,
             killed: false,
             fade_out: 1.0,
@@ -169,6 +173,11 @@ impl<'a> EmitterSim<'a> {
         self.time = time;
         self.spawn(count);
         self.rng.0
+    }
+
+    /// Set the particle colour (`LAST_PARTICLE_SET_COLOR`): red, green, blue and opacity.
+    pub fn set_particle_colour(&mut self, colour: [f32; 4]) {
+        self.particle_colour = colour;
     }
 
     pub fn count(&self) -> usize {
@@ -434,8 +443,8 @@ impl<'a> EmitterSim<'a> {
             out.entry("sysScaleAttr").or_default().push(p.scale);
             out.entry("sysRandomAttr").or_default().push(p.random);
             out.entry("sysInitRotateAttr").or_default().push(p.rotate);
-            out.entry("sysColor0Attr").or_default().push([1.0; 4]);
-            out.entry("sysColor1Attr").or_default().push([1.0; 4]);
+            out.entry("sysColor0Attr").or_default().push(self.particle_colour);
+            out.entry("sysColor1Attr").or_default().push(self.particle_colour);
             out.entry("sysEmtMat0Attr").or_default().push(rows[0]);
             out.entry("sysEmtMat1Attr").or_default().push(rows[1]);
             out.entry("sysEmtMat2Attr").or_default().push(rows[2]);
