@@ -89,6 +89,10 @@ pub struct EmitterSim<'a> {
     /// (emitter+0x3c0), for distance emission and birth matrices.
     current: Mat4,
     previous_translation: Option<Vec3>,
+    /// The emitter set's scale this frame (the scale an `EFFECT` call asks for). The game
+    /// passes it to the shaders as the particle scale, beside the fade (live probe: Dark Samus's
+    /// up tilt arc, scale 1.65 at her 0.96, reads 1.584 there).
+    set_scale: Vec3,
     /// Distance travelled and not yet emitted for (distance emission).
     distance: f32,
     /// Set when the effect is killed (`EFFECT_OFF_KIND`; the game's fade request).
@@ -124,6 +128,7 @@ impl<'a> EmitterSim<'a> {
             particles: Vec::new(),
             current: local,
             previous_translation: None,
+            set_scale: Vec3::ONE,
             distance: 0.0,
             killed: false,
             fade_out: 1.0,
@@ -267,6 +272,7 @@ impl<'a> EmitterSim<'a> {
     /// keeps the matrix it was born with.
     pub fn step_at(&mut self, set: &Mat4) {
         self.current = *set * self.local;
+        self.set_scale = set.to_scale_rotation_translation().0;
         let translation = self.current.w_axis.truncate();
         let moved = self
             .previous_translation
@@ -463,10 +469,13 @@ impl<'a> EmitterSim<'a> {
                 * (if on(fade_out) { self.fade_out } else { 1.0 })
         };
         v[12] = fade(0x75b, 0x755);
-        let scale = fade(0x75c, 0x756);
-        v[13] = scale;
-        v[14] = scale;
-        v[15] = scale;
+        // The particle scale: the set's scale times the scale fade. Particles are drawn with
+        // the unscaled matrix (`rt`) and this, so leaving the set's scale out drew every
+        // particle of a scaled effect at size 1 while its emitter moved as scaled.
+        let fade_scale = fade(0x75c, 0x756);
+        v[13] = fade_scale * self.set_scale.x;
+        v[14] = fade_scale * self.set_scale.y;
+        v[15] = fade_scale * self.set_scale.z;
         let rows = |m: &Mat4| m.transpose().to_cols_array();
         v[16..32].copy_from_slice(&rows(srt));
         v[32..48].copy_from_slice(&rows(rt));

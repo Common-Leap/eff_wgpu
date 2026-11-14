@@ -252,3 +252,30 @@ fn a_killed_emitter_stops_emitting_and_fades_as_its_flags_say() {
     assert!(checked > 1000, "{checked}");
     assert_eq!(fading, 1, "no fading emitter found to test");
 }
+
+#[test]
+fn the_particle_scale_carries_the_set_scale() {
+    if std::env::var_os("VFX_GAME_EFFECTS").is_none() {
+        eprintln!("VFX_GAME_EFFECTS not set; skipped");
+        return;
+    }
+    // Live probe: Dark Samus's up tilt spawns sys_attack_arc_b at scale 1.65 (1.584 at her
+    // 0.96) and the game's dynamic block holds 1.584 at 0x34..0x40, beside the scale fade.
+    let particle_scale = |steps: u32, emitter: usize, scale: f32| {
+        with_emitter(emitter, |s| {
+            let set = glam::Mat4::from_scale(glam::Vec3::splat(scale));
+            for _ in 0..steps {
+                s.step_at(&set);
+            }
+            let block = s.dynamic_block(&set, &glam::Mat4::IDENTITY, [1.0; 4]);
+            let f = |at: usize| f32::from_le_bytes(block[at..at + 4].try_into().unwrap());
+            [f(0x34), f(0x38), f(0x3c)]
+        })
+    };
+    // fire1 has no scale fade: the set's scale as it is.
+    assert_eq!(particle_scale(6, 0, 1.584), [1.584; 3]);
+    // ciecle3 fades its scale in over six frames: half way, half the set's scale.
+    assert_eq!(particle_scale(3, 1, 2.0), [1.0; 3]);
+    // Unscaled, as before.
+    assert_eq!(particle_scale(6, 0, 1.0), [1.0; 3]);
+}
