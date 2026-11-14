@@ -306,15 +306,15 @@ impl<'a> EmitterSim<'a> {
         let frame = self.time;
         let emission = &self.data.emission;
         let start = emission.start as f32;
-        // A one-time emitter emits at its rate, by the same timer as any other, for its duration
-        // and then stops: sys_atk_smoke's impact3 (rate 1.5 for 3 frames) has 1, 3 and then 4
-        // particles in game, read live from the emitter. Other emitters keep emitting.
-        let active = may_emit && if emission.is_one_time {
-            frame >= start && frame < start + emission.duration.max(1) as f32
-        } else {
-            frame >= start
-                && (emission.duration == 0 || frame < start + emission.duration as f32)
-        };
+        // EmitterCalculator::Calculate: emission begins at res+0x7f4. A one-time emitter
+        // (res+0x7f0) emits for res+0x7fc frames from there and then stops: sys_atk_smoke's
+        // impact3 (rate 1.5 for 3 frames) has 1, 3 and then 4 particles in game, read live
+        // from the emitter. Any other emitter keeps emitting until it is killed; the duration
+        // does not stop it (only a child emitter's). Measured in game, Mario's fireball trail
+        // (duration 4) keeps adding flames long after its fourth frame.
+        let active = may_emit
+            && frame >= start
+            && (!emission.is_one_time || frame < start + emission.duration.max(1) as f32);
         // Rate randomness and interval spread are integers in the file (res+0x804, +0x80c).
         let rate_random = i32_at(self.raw, 0x804) as f32 / 100.0;
         if active && self.raw.get(0x7f2).copied().unwrap_or(0) != 0 {

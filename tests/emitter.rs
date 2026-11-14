@@ -88,7 +88,8 @@ fn distance_emission_follows_the_path_the_emitter_moved() {
         eprintln!("VFX_GAME_EFFECTS not set; skipped");
         return;
     }
-    // fire1 (emitter 0): distance emission, one particle every 2.0 units, frames 2-5.
+    // fire1 (emitter 0): distance emission, one particle every 2.0 units, from frame 2. Its
+    // duration (4) does not stop it: in game the fireball trail keeps adding flames.
     let counts = |speed: f32| {
         with_emitter(0, |s| {
             for frame in 0..8 {
@@ -103,10 +104,10 @@ fn distance_emission_follows_the_path_the_emitter_moved() {
     };
     // Standing still emits nothing, as in the game.
     assert_eq!(counts(0.0), 0);
-    // 1.4 a frame over frames 2-5: 1.4, 2.8 (one, 0.8 left), 2.2 (one, 0.2 left), 1.6.
-    assert_eq!(counts(1.4), 2);
-    // 3.0 a frame: one per frame plus the carried remainder, six in all.
-    assert_eq!(counts(3.0), 6);
+    // 1.4 a frame over frames 2-7: 8.4 units, four particles.
+    assert_eq!(counts(1.4), 4);
+    // 3.0 a frame: 18 units, nine particles.
+    assert_eq!(counts(3.0), 9);
 }
 
 #[test]
