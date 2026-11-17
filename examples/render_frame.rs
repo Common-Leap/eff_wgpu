@@ -1,7 +1,7 @@
 //! cargo run --example render_frame -- ef_x.eff SET FRAME out.png
 //! Draws one emitter set FRAME frames after it starts, with the game's shaders, white textures.
 use glam::{Mat4, Vec3};
-use vfx_runtime::{bnsh, ptcl, render, sim, static_block, view_block};
+use eff_wgpu::{bnsh, ptcl, render, sim, static_block, view_block};
 
 fn main() {
     let a: Vec<String> = std::env::args().collect();
@@ -96,8 +96,8 @@ fn main() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(40.0);
     let eye = Vec3::new(0.0, 0.0, distance);
-    let cam = Mat4::look_at_rh(eye, Vec3::ZERO, Vec3::Y);
-    let proj = Mat4::perspective_rh(45f32.to_radians(), 1.0, 1.0, 1000.0);
+    let cam = glam::camera::rh::view::look_at_mat4(eye, Vec3::ZERO, Vec3::Y);
+    let proj = glam::camera::rh::proj::directx::perspective(45f32.to_radians(), 1.0, 1.0, 1000.0);
     let rows = |m: Mat4| m.transpose().to_cols_array_2d();
     if let Ok(path) = std::env::var("VIEW_FILE") {
         renderer.set_view(&queue, &std::fs::read(path).unwrap());
@@ -118,7 +118,7 @@ fn main() {
         ));
     }
     let only: Option<usize> = std::env::var("ONLY").ok().and_then(|v| v.parse().ok());
-    let meshes = vfx_runtime::mesh::meshes(&ptcl_file);
+    let meshes = eff_wgpu::mesh::meshes(&ptcl_file);
     let ids: Vec<u64> = ptcl_file
         .texture_info
         .as_ref()
@@ -131,7 +131,7 @@ fn main() {
         views.push(slots.map(|s| {
             let wanted = s.as_ref()?.texture_id;
             let index = ids.iter().position(|id| *id == wanted)?;
-            let t = vfx_runtime::texture::decode(&ptcl_file, index)?;
+            let t = eff_wgpu::texture::decode(&ptcl_file, index)?;
             Some(render::upload_texture(&device, &queue, &t))
         }));
         samplers.push(slots.map(|s| {
@@ -294,7 +294,7 @@ fn main() {
     queue.submit([encoder.finish()]);
     readback.slice(..).map_async(wgpu::MapMode::Read, |_| {});
     device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
-    let pixels = readback.slice(..).get_mapped_range().to_vec();
+    let pixels = readback.slice(..).get_mapped_range().expect("mapped").to_vec();
     let file = std::fs::File::create(out).unwrap();
     let mut enc = png::Encoder::new(file, width, height);
     enc.set_color(png::ColorType::Rgba);

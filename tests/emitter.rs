@@ -1,6 +1,6 @@
 //! Emitter state against a real effect. Point VFX_GAME_EFFECTS at the game's `effect` folder
 //! (skipped when unset).
-use vfx_runtime::{ptcl, sim, static_block};
+use eff_wgpu::{ptcl, sim, static_block};
 
 fn with_emitter<T>(emitter: usize, f: impl FnOnce(&mut sim::EmitterSim) -> T) -> T {
     let root = std::path::PathBuf::from(std::env::var_os("VFX_GAME_EFFECTS").unwrap());
@@ -126,7 +126,7 @@ fn bank_one_literals_match_a_captured_game_draw() {
         .unwrap()
         .binary_data
         .unwrap();
-    let file = vfx_runtime::bnsh::ShaderFile::read(&bin).unwrap();
+    let file = eff_wgpu::bnsh::ShaderFile::read(&bin).unwrap();
     // Program 6 is the fireball disc ciecle3; the game bound these 32 bytes as its vertex bank 1.
     let captured: Vec<u8> = [
         1.0f32.to_bits(),

@@ -4,14 +4,14 @@ fn main() {
     let data = std::fs::read(&path).unwrap();
     let eff = effect_library::namco_file::NamcoEffectFile::load(&data).unwrap();
     let ptcl = eff.ptcl_file.unwrap().base_bytes;
-    for h in vfx_runtime::ptcl::top_level(&ptcl) {
+    for h in eff_wgpu::ptcl::top_level(&ptcl) {
         println!(
             "top {} size {:#x}",
             String::from_utf8_lossy(&h.magic),
             h.size
         );
     }
-    let sets = vfx_runtime::ptcl::emitter_sets(&ptcl);
+    let sets = eff_wgpu::ptcl::emitter_sets(&ptcl);
     println!("{} sets", sets.len());
     for (i, s) in sets.iter().enumerate().take(3) {
         for (j, e) in s.emitters.iter().enumerate() {

@@ -495,7 +495,7 @@ impl EffectRenderer {
         queue.submit([encoder.finish()]);
         read.slice(..).map_async(wgpu::MapMode::Read, |_| {});
         self.device.poll(wgpu::PollType::wait_indefinitely()).ok()?;
-        let bytes = read.slice(..).get_mapped_range().to_vec();
+        let bytes = read.slice(..).get_mapped_range().ok()?.to_vec();
         let values = bytes
             .chunks(16)
             .map(|c| {
@@ -715,7 +715,7 @@ impl EffectRenderer {
                         module: &c.vertex,
                         entry_point: Some("main"),
                         compilation_options: Default::default(),
-                        buffers: &buffers,
+                        buffers: &buffers.into_iter().map(Some).collect::<Vec<_>>(),
                     },
                     primitive: wgpu::PrimitiveState {
                         topology: if mesh {

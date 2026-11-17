@@ -1,6 +1,6 @@
 //! Every program dumped from real effect files translates to WGSL that naga accepts.
 //! Point VFX_SHADER_DUMP at a folder written by `examples/dump_code` (skipped when unset).
-use vfx_runtime::maxwell::{decode::decode_program, wgsl};
+use eff_wgpu::maxwell::{decode::decode_program, wgsl};
 
 #[test]
 fn every_dumped_program_translates_and_validates() {

@@ -5,7 +5,7 @@
 //! out behind an attribute-less vertex buffer and read zeros, so every billboard collapsed to a
 //! point while mesh emitters still drew.
 use glam::{Mat4, Vec3};
-use vfx_runtime::{bnsh, ptcl, render, sim, static_block, texture, view_block};
+use eff_wgpu::{bnsh, ptcl, render, sim, static_block, texture, view_block};
 
 #[test]
 fn mario_fireball_flame_quads_cover_pixels() {
@@ -62,8 +62,8 @@ fn mario_fireball_flame_quads_cover_pixels() {
     let renderer = render::EffectRenderer::new(&device, &queue, &shaders, format, None);
     let eye = Vec3::new(0.0, 0.0, 25.0);
     let rows = |m: Mat4| m.transpose().to_cols_array_2d();
-    let cam = Mat4::look_at_rh(eye, Vec3::ZERO, Vec3::Y);
-    let proj = Mat4::perspective_rh(45f32.to_radians(), 1.0, 1.0, 1000.0);
+    let cam = glam::camera::rh::view::look_at_mat4(eye, Vec3::ZERO, Vec3::Y);
+    let proj = glam::camera::rh::proj::directx::perspective(45f32.to_radians(), 1.0, 1.0, 1000.0);
     renderer.set_view(
         &queue,
         &view_block::view_block(&rows(cam), &rows(proj), eye.into(), 1.0, 1000.0, 1.0),
@@ -183,7 +183,7 @@ fn mario_fireball_flame_quads_cover_pixels() {
     queue.submit([encoder.finish()]);
     readback.slice(..).map_async(wgpu::MapMode::Read, |_| {});
     device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
-    let pixels = readback.slice(..).get_mapped_range().to_vec();
+    let pixels = readback.slice(..).get_mapped_range().expect("mapped").to_vec();
     let lit = pixels.chunks_exact(4).filter(|p| p[0] > 32).count();
     assert!(lit > 500, "only {lit} pixels lit");
 }

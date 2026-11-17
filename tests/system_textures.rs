@@ -6,7 +6,7 @@
 //! and Final Smash moves.
 use glam::Mat4;
 use std::sync::{Arc, Mutex};
-use vfx_runtime::{bnsh, ptcl, render, sim, static_block};
+use eff_wgpu::{bnsh, ptcl, render, sim, static_block};
 
 #[test]
 fn frame_and_depth_reading_emitters_prepare_without_errors() {
@@ -46,7 +46,7 @@ fn frame_and_depth_reading_emitters_prepare_without_errors() {
         None,
     );
     let raw = ptcl::emitter_sets(&p.base_bytes);
-    let meshes = vfx_runtime::mesh::meshes(p);
+    let meshes = eff_wgpu::mesh::meshes(p);
     let mut prepared = 0;
     for name in ["P_MarioPumpHit2", "P_MarioFinalBg"] {
         let index = p

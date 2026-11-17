@@ -12,7 +12,7 @@ fn main() {
         .iter()
         .position(|d| d.name == a[2])
         .unwrap();
-    let t = vfx_runtime::texture::decode(&p, index).unwrap();
+    let t = eff_wgpu::texture::decode(&p, index).unwrap();
     let m = &t.mips[0];
     for c in 0..4 {
         let grey: Vec<u8> = m.chunks_exact(4).map(|px| px[c]).collect();

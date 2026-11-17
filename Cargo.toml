@@ -1,19 +1,22 @@
 [package]
-name = "vfx_runtime"
+name = "eff_wgpu"
 version = "0.1.0"
 edition = "2021"
-description = "Simulates and draws Smash Ultimate effects (nn::vfx) the way the game does"
+rust-version = "1.87"
+description = "Simulates and draws Smash Ultimate effect files (.eff) with wgpu, the way the game does"
+repository = "https://github.com/Common-Leap/eff_wgpu"
+readme = "README.md"
 license = "MIT"
 
 [dependencies]
 effect_library = "1.1.4"
-wgpu = "29.0.1"
-glam = "0.28.0"
+wgpu = "30.0.2"
+glam = "0.34.3"
 bntx = { git = "https://github.com/ScanMountGoat/bntx.git", rev = "87fffc7d17238cb07ff93ec75e0a7b5db15f4683" }
 image_dds = { version = "0.7", default-features = false }
 binrw = "0.15"
 
 [dev-dependencies]
-png = "0.17"
-pollster = "0.4"
-naga = { version = "29.0.1", features = ["wgsl-in"] }
+png = "0.18"
+pollster = "1.0"
+naga = { version = "30.0.2", features = ["wgsl-in"] }

@@ -2,7 +2,7 @@
 //! set of every .eff at a few frames, reporting wgpu errors and panics per set.
 use glam::{Mat4, Vec3};
 use std::sync::{Arc, Mutex};
-use vfx_runtime::{bnsh, mesh, ptcl, render, sim, static_block, texture, view_block};
+use eff_wgpu::{bnsh, mesh, ptcl, render, sim, static_block, texture, view_block};
 
 fn files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
     for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
@@ -73,8 +73,8 @@ fn main() {
             renderer.set_view(
                 &queue,
                 &view_block::view_block(
-                    &rows(Mat4::look_at_rh(eye, Vec3::ZERO, Vec3::Y)),
-                    &rows(Mat4::perspective_rh(0.8, 1.0, 1.0, 1000.0)),
+                    &rows(glam::camera::rh::view::look_at_mat4(eye, Vec3::ZERO, Vec3::Y)),
+                    &rows(glam::camera::rh::proj::directx::perspective(0.8, 1.0, 1.0, 1000.0)),
                     eye.into(),
                     1.0,
                     1000.0,
