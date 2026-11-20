@@ -252,6 +252,20 @@ impl<'a> EmitterSim<'a> {
                 self.rng.next(),
                 self.rng.next(),
             ];
+            // InitRotate: the initial angle (0x700..) plus its random range (0x710..) times a
+            // draw, each axis cleared at load when that axis does not rotate. These offsets
+            // were 0x320.., the second sampler's texture scale (1, 1), which turned every mesh
+            // particle 57 degrees about X and Y: Sephiroth's charge ball was seen side on.
+            let mut rotate = [0.0f32; 4];
+            for (axis, angle) in rotate.iter_mut().take(3).enumerate() {
+                let range = f32_at(raw, 0x710 + 4 * axis);
+                *angle = f32_at(raw, 0x700 + 4 * axis)
+                    + if range != 0.0 {
+                        range * self.rng.next()
+                    } else {
+                        0.0
+                    };
+            }
             self.particles.push(Live {
                 position,
                 velocity: vel,
@@ -260,12 +274,7 @@ impl<'a> EmitterSim<'a> {
                 birth: self.time,
                 scale: scale4,
                 random,
-                rotate: [
-                    f32_at(self.raw, 0x320),
-                    f32_at(self.raw, 0x324),
-                    f32_at(self.raw, 0x328),
-                    0.0,
-                ],
+                rotate,
                 birth_matrix: self.current,
             });
         }
@@ -443,8 +452,12 @@ impl<'a> EmitterSim<'a> {
             out.entry("sysScaleAttr").or_default().push(p.scale);
             out.entry("sysRandomAttr").or_default().push(p.random);
             out.entry("sysInitRotateAttr").or_default().push(p.rotate);
-            out.entry("sysColor0Attr").or_default().push(self.particle_colour);
-            out.entry("sysColor1Attr").or_default().push(self.particle_colour);
+            out.entry("sysColor0Attr")
+                .or_default()
+                .push(self.particle_colour);
+            out.entry("sysColor1Attr")
+                .or_default()
+                .push(self.particle_colour);
             out.entry("sysEmtMat0Attr").or_default().push(rows[0]);
             out.entry("sysEmtMat1Attr").or_default().push(rows[1]);
             out.entry("sysEmtMat2Attr").or_default().push(rows[2]);
@@ -556,10 +569,7 @@ fn spawn_shape(data: &EmitterData, rng: &mut Lcg, index: usize, count: usize) ->
             };
             circle(angle, fill)
         }
-        2 => circle(
-            first + sweep * index as f32 / count.max(1) as f32,
-            1.0,
-        ),
+        2 => circle(first + sweep * index as f32 / count.max(1) as f32, 1.0),
         4..=7 => {
             let dir = rng.unit_vector();
             let fill = if shape.volume_type == 7 {

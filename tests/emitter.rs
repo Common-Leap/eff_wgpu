@@ -322,3 +322,54 @@ fn a_particle_draws_on_the_frame_it_is_born_and_for_its_whole_life() {
     assert_eq!(arc_b_counts("arccylinder1", 3), vec![1, 0, 0]);
     assert_eq!(arc_b_counts("arccylinder2", 5), vec![0, 1, 1, 1, 0]);
 }
+
+/// Sephiroth's blue charge (edge_fire2_hold): an emitter's initial rotation comes from its own
+/// rotation fields. It was read from the second sampler's texture scale (1, 1), which turned
+/// every mesh particle 57 degrees about X and Y, so the charge ball was seen side on.
+#[test]
+fn particles_start_at_their_own_initial_rotation() {
+    let Some(root) = std::env::var_os("VFX_GAME_EFFECTS") else {
+        eprintln!("VFX_GAME_EFFECTS not set; skipped");
+        return;
+    };
+    let data = std::fs::read(std::path::Path::new(&root).join("fighter/edge/ef_edge.eff")).unwrap();
+    let eff = effect_library::namco_file::NamcoEffectFile::load(&data).unwrap();
+    let p = eff.ptcl_file.as_ref().unwrap();
+    let set = p
+        .emitter_list
+        .emitter_sets
+        .iter()
+        .position(|s| s.name == "P_EdgeFire2Hold")
+        .unwrap();
+    let rotation = |name: &str| {
+        let index = p.emitter_list.emitter_sets[set]
+            .emitters
+            .iter()
+            .position(|e| e.data.name.as_deref() == Some(name))
+            .unwrap();
+        let raw = &ptcl::emitter_sets(&p.base_bytes)[set].emitters[index];
+        let fixed = static_block::fixed_emitter_data(raw, &|_| None, None);
+        let mut s = sim::EmitterSim::new(
+            &p.emitter_list.emitter_sets[set].emitters[index].data,
+            &fixed,
+        );
+        for _ in 0..30 {
+            s.step();
+        }
+        s.streams()["sysInitRotateAttr"].clone()
+    };
+    // No initial angle and no random range: no rotation.
+    for particle in rotation("sphere1") {
+        assert_eq!(particle, [0.0; 4]);
+    }
+    // Random ranges of 50 degrees about X and a full turn about Y and Z: within them, and not
+    // all alike.
+    let ring = rotation("lightning_ring1_bk");
+    assert!(!ring.is_empty());
+    for [x, y, z, _] in &ring {
+        assert!((0.0..=0.873).contains(x), "{x}");
+        assert!(
+            (0.0..=std::f32::consts::TAU).contains(y) && (0.0..=std::f32::consts::TAU).contains(z)
+        );
+    }
+}
