@@ -523,3 +523,158 @@ fn child_emitters_trail_their_parent_particles() {
             .any(|c| c[..3] != [1.0, 1.0, 1.0]));
     }
 }
+
+/// The flames Mario's fireball leaves (MARIO_FB_BULLET_R fire1) take a tenth of the
+/// fireball's move backward (res+0x990 = -0.1, InitializeParticle adds it to a new particle's
+/// velocity), so the trail drifts behind the ball. The preview's flames ignored the emitter's
+/// move and stood still where they were dropped.
+#[test]
+fn new_particles_take_part_of_the_emitters_move() {
+    if std::env::var_os("VFX_GAME_EFFECTS").is_none() {
+        eprintln!("VFX_GAME_EFFECTS not set; skipped");
+        return;
+    }
+    let velocities = with_emitter(0, |s| {
+        for frame in 0..16 {
+            s.step_at(&glam::Mat4::from_translation(glam::Vec3::new(
+                3.0 * frame as f32,
+                0.0,
+                0.0,
+            )));
+        }
+        s.streams()["sysLocalVecAttr"].clone()
+    });
+    // Moving 3 a frame along x adds -0.3 to every flame's x velocity. Its own velocity is
+    // 0.3 in a random direction, which averages out over the trail.
+    let n = velocities.len() as f32;
+    assert!(n >= 10.0, "{velocities:?}");
+    let mean = velocities.iter().fold(glam::Vec3::ZERO, |sum, v| {
+        sum + glam::Vec3::new(v[0], v[1], v[2])
+    }) / n;
+    assert!(mean.x < -0.2 && mean.x > -0.4, "{mean}");
+}
+
+/// Sephiroth's charge sparks (edge_fire2_hold sparks4) drop gold dots through Emitter1, a child
+/// that emits by distance (one dot every 1.5 of the spark's travel) and takes a fifth of the
+/// spark's move (res+0x990 = 0.2), so the dots creep in after the spark and each trail draws
+/// out into a long dotted line. Emitter2 emits by time, one a frame, and is handed no move.
+/// Children emitted one dot a frame each, standing still, which drew short clumps.
+#[test]
+fn a_child_that_emits_by_distance_follows_its_parents_move() {
+    let Some(root) = std::env::var_os("VFX_GAME_EFFECTS") else {
+        eprintln!("VFX_GAME_EFFECTS not set; skipped");
+        return;
+    };
+    let data = std::fs::read(std::path::Path::new(&root).join("fighter/edge/ef_edge.eff")).unwrap();
+    let eff = effect_library::namco_file::NamcoEffectFile::load(&data).unwrap();
+    let p = eff.ptcl_file.as_ref().unwrap();
+    let set = p
+        .emitter_list
+        .emitter_sets
+        .iter()
+        .position(|s| s.name == "P_EdgeFire2Hold")
+        .unwrap();
+    let index = p.emitter_list.emitter_sets[set]
+        .emitters
+        .iter()
+        .position(|e| e.data.name.as_deref() == Some("sparks4"))
+        .unwrap();
+    let parsed = &p.emitter_list.emitter_sets[set].emitters[index];
+    let raw = &ptcl::emitter_sets(&p.base_bytes)[set].emitters[index];
+    let fixed = static_block::fixed_emitter_data(raw, &|_| None, None);
+    let children: Vec<Vec<u8>> = raw
+        .children
+        .iter()
+        .map(|c| static_block::fixed_emitter_data(c, &|_| None, None))
+        .collect();
+    let mut s = sim::EmitterSim::new(&parsed.data, &fixed);
+    for (child, fixed) in parsed.children.iter().zip(&children) {
+        s.add_child(&child.data, fixed);
+    }
+    for _ in 0..40 {
+        s.step();
+    }
+    let by_distance = &s.children()[0];
+    let by_time = &s.children()[1];
+    // A spark flies in at up to 1 a frame: by distance it drops at most one dot every 1.5
+    // frames, by time one every frame.
+    assert!(by_distance.count() > 0);
+    assert!(
+        (by_distance.count() as f32) < by_time.count() as f32 * 0.8,
+        "{} by distance, {} by time",
+        by_distance.count(),
+        by_time.count()
+    );
+    // The distance child's dots move inward, a fifth as fast as the sparks.
+    let streams = by_distance.streams();
+    for (pos, vel) in streams["sysLocalPosAttr"]
+        .iter()
+        .zip(&streams["sysLocalVecAttr"])
+    {
+        let pos = glam::Vec3::new(pos[0], pos[1], pos[2]);
+        let vel = glam::Vec3::new(vel[0], vel[1], vel[2]);
+        assert!(vel.length() > 0.05 && vel.length() < 0.21, "{vel}");
+        assert!(pos.dot(vel) < 0.0, "{pos} {vel}");
+    }
+    // The time child is handed no move: its dots only fall by its tiny gravity.
+    for vel in &by_time.streams()["sysLocalVecAttr"] {
+        assert!(glam::Vec2::new(vel[0], vel[2]).length() < 1e-6, "{vel:?}");
+    }
+}
+
+/// Sephiroth's charge sparks (edge_fire2_hold sparks4) carry a convergence field (FCOV: 0.11 of
+/// the way to the centre a frame) on top of flying in at up to 1 a frame. The game draws long
+/// gold lines that reach the ball within their life; run without the field they crept a third
+/// of the way and drew short dashes.
+#[test]
+fn a_convergence_field_pulls_particles_to_its_target() {
+    let Some(root) = std::env::var_os("VFX_GAME_EFFECTS") else {
+        eprintln!("VFX_GAME_EFFECTS not set; skipped");
+        return;
+    };
+    let data = std::fs::read(std::path::Path::new(&root).join("fighter/edge/ef_edge.eff")).unwrap();
+    let eff = effect_library::namco_file::NamcoEffectFile::load(&data).unwrap();
+    let p = eff.ptcl_file.as_ref().unwrap();
+    let set = p
+        .emitter_list
+        .emitter_sets
+        .iter()
+        .position(|s| s.name == "P_EdgeFire2Hold")
+        .unwrap();
+    let index = p.emitter_list.emitter_sets[set]
+        .emitters
+        .iter()
+        .position(|e| e.data.name.as_deref() == Some("sparks4"))
+        .unwrap();
+    let parsed = &p.emitter_list.emitter_sets[set].emitters[index];
+    let raw = &ptcl::emitter_sets(&p.base_bytes)[set].emitters[index];
+    let fields = sim::Fields::of(&raw.attributes);
+    let convergence = fields.convergence.expect("sparks4 has a convergence field");
+    assert_eq!(convergence.target, glam::Vec3::ZERO);
+    assert!((convergence.strength - 0.11).abs() < 1e-6);
+    let fixed = static_block::fixed_emitter_data(raw, &|_| None, None);
+    // The first sparks (frame 18) six frames on: how far from the centre each still is,
+    // against where it started.
+    let radii = |with_fields: bool| {
+        let mut s = sim::EmitterSim::new(&parsed.data, &fixed);
+        if with_fields {
+            s.set_fields(fields);
+        }
+        for _ in 0..25 {
+            s.step();
+        }
+        s.streams()["sysLocalPosAttr"]
+            .iter()
+            .map(|p| glam::Vec3::new(p[0], p[1], p[2]).length())
+            .collect::<Vec<_>>()
+    };
+    let (plain, pulled) = (radii(false), radii(true));
+    assert_eq!(plain.len(), pulled.len());
+    assert!(!plain.is_empty());
+    // Same sparks, same seed: every one is nearer the centre with the field, and by a lot.
+    let mean = |r: &[f32]| r.iter().sum::<f32>() / r.len() as f32;
+    for (a, b) in plain.iter().zip(&pulled) {
+        assert!(b < a, "{plain:?} {pulled:?}");
+    }
+    assert!(mean(&pulled) < mean(&plain) * 0.7, "{plain:?} {pulled:?}");
+}

@@ -74,6 +74,44 @@ fn f32_at(b: &[u8], at: usize) -> f32 {
         .unwrap_or(0.0)
 }
 
+/// The field sections (`ptcl::Emitter::attributes`) that move an emitter's particles on the
+/// CPU (EmitterCalculator::CalculateParticleBehavior). Read with [`Fields::of`].
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Fields {
+    /// FCOV: each frame a particle moves `strength` of the way to `target`. With `relative`,
+    /// the target is taken from where the emitter is now (FieldConvergence's second type).
+    pub convergence: Option<Convergence>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Convergence {
+    pub relative: bool,
+    pub target: Vec3,
+    pub strength: f32,
+}
+
+impl Fields {
+    /// The fields an emitter's attribute sections (`ptcl::Emitter::attributes`) hold. FCOV is
+    /// a type byte, the target (+4..+0x10) and the strength (+0x10); an 8-key animation of the
+    /// strength (key count at +0x14) is not run, the constant stands in for it.
+    pub fn of(attributes: &[([u8; 4], Vec<u8>)]) -> Self {
+        let section = |magic: &[u8; 4]| {
+            attributes
+                .iter()
+                .find(|(m, _)| m == magic)
+                .map(|(_, d)| d.as_slice())
+        };
+        let convergence = section(b"FCOV")
+            .filter(|d| d.len() >= 0x14)
+            .map(|d| Convergence {
+                relative: d[0] != 0,
+                target: Vec3::new(f32_at(d, 4), f32_at(d, 8), f32_at(d, 0xc)),
+                strength: f32_at(d, 0x10),
+            });
+        Fields { convergence }
+    }
+}
+
 /// Live particles one emitter keeps, the most the renderer draws in one call.
 pub const MAX_PARTICLES: usize = 4096;
 
@@ -110,6 +148,11 @@ pub struct EmitterSim<'a> {
     particle_colour: [f32; 4],
     /// Distance travelled and not yet emitted for (distance emission).
     distance: f32,
+    /// How far the emitter moved over the last frame, in its own space (emitter+0x3d0): a new
+    /// particle takes res+0x990 times it as extra velocity, and distance emission measures it.
+    /// A child emitter's is its parent particle's last move, set only when the child emits by
+    /// distance (Smash 0x8d70).
+    emitter_velocity: Vec3,
     /// The next division an equally divided shape emits from when res+0x874 is 2
     /// (emitter+0x38).
     divide_counter: i32,
@@ -122,6 +165,7 @@ pub struct EmitterSim<'a> {
     spawn_colours: Option<[[f32; 4]; 2]>,
     /// Set when the effect is killed (`EFFECT_OFF_KIND`; the game's fade request).
     killed: bool,
+    fields: Fields,
     /// Fade-out after a kill (emitter+0x70): 1 to 0 over res+0x768 frames when res+0x755
     /// (alpha) or res+0x756 (scale) asks for it.
     fade_out: f32,
@@ -156,12 +200,14 @@ impl<'a> EmitterSim<'a> {
             set_scale: Vec3::ONE,
             particle_colour: [1.0; 4],
             distance: 0.0,
+            emitter_velocity: Vec3::ZERO,
             divide_counter: 0,
             children: Vec::new(),
             spawn_offset: Vec3::ZERO,
             spawn_velocity: Vec3::ZERO,
             spawn_colours: None,
             killed: false,
+            fields: Fields::default(),
             fade_out: 1.0,
             finished: false,
         }
@@ -177,10 +223,17 @@ impl<'a> EmitterSim<'a> {
 
     /// Add a child emitter (`data` parsed, `raw` after load-time fixes): it emits from every
     /// live particle of this emitter, as the game's child emitters do (Smash 0x8d70).
-    pub fn add_child(&mut self, data: &'a EmitterData, raw: &'a [u8]) {
+    pub fn add_child(&mut self, data: &'a EmitterData, raw: &'a [u8]) -> &mut EmitterSim<'a> {
         let mut child = EmitterSim::new(data, raw);
         child.time = self.time;
         self.children.push(child);
+        self.children.last_mut().unwrap()
+    }
+
+    /// Run the emitter's field sections on its particles (see [`Fields`]). Without this they
+    /// move only by their velocity, gravity and air resistance.
+    pub fn set_fields(&mut self, fields: Fields) {
+        self.fields = fields;
     }
 
     /// The child emitters, each drawn as its own emitter.
@@ -281,6 +334,10 @@ impl<'a> EmitterSim<'a> {
             let mut vel =
                 normal * velocity.all_direction + direction * velocity.designated_dir_scale;
             vel *= 1.0 - self.rng.next() * velocity.vel_random / 100.0;
+            // InitializeParticle (Smash 0xa2d0): plus the emitter's own movement (emitter+0x3d0)
+            // times res+0x990. Sephiroth's charge sparks drop gold dots that drift in after
+            // them (0.2), so each trail stretches as it goes.
+            vel += self.emitter_velocity * f32_at(self.raw, 0x990);
             vel += self.spawn_velocity;
             // Life (InitializeParticle): life * (1 - randint(0..=life_random) / 100), or
             // 2^28 frames when infinite.
@@ -368,6 +425,13 @@ impl<'a> EmitterSim<'a> {
             .previous_translation
             .map_or(Vec3::ZERO, |previous| translation - previous);
         let previous = self.previous_translation.unwrap_or(translation);
+        // EmitterCalculator::Calculate: the move since last frame through the inverse of the
+        // emitter's matrix (emitter+0x3d0).
+        self.emitter_velocity = if self.current.determinant().abs() > 1e-12 {
+            self.current.inverse().transform_vector3(moved)
+        } else {
+            Vec3::ZERO
+        };
         if self.fade_in < 1.0 {
             let frames = i32_at(self.raw, 0x76c);
             self.fade_in = if frames < 1 {
@@ -444,14 +508,7 @@ impl<'a> EmitterSim<'a> {
             statics.gravity_dir_z,
         ) * statics.gravity_scale;
         let air = statics.air_res;
-        for particle in &mut self.particles {
-            particle.position += particle.velocity;
-            particle.diff = particle.velocity;
-            if air != 1.0 {
-                particle.velocity *= air;
-            }
-            particle.velocity += gravity;
-        }
+        self.move_particles(gravity, air);
         self.time += 1.0;
         // A particle draws `life` times, the frame it is born included: the game ages and
         // removes particles before it emits, so a new one always reaches the screen (live
@@ -460,6 +517,33 @@ impl<'a> EmitterSim<'a> {
         let now = self.time;
         self.particles.retain(|p| now - 1.0 - p.birth < p.life);
         self.step_children();
+    }
+
+    /// One frame of motion for every particle (CalculateParticleBehavior): position by
+    /// velocity, then air resistance and gravity on the velocity, then the field sections.
+    fn move_particles(&mut self, gravity: Vec3, air: f32) {
+        let follows = self.raw.get(0x753).copied().unwrap_or(0) != 1;
+        let here = self.current.w_axis.truncate();
+        for particle in &mut self.particles {
+            let before = particle.position;
+            particle.position += particle.velocity;
+            if air != 1.0 {
+                particle.velocity *= air;
+            }
+            particle.velocity += gravity;
+            // FieldConvergence: a share of the way to the target each frame, times the
+            // particle's scale w. Sephiroth's charge sparks (0.11 a frame to the centre) speed
+            // in from as far as 30 away; without it they crept in at their own 1 a frame.
+            if let Some(c) = self.fields.convergence {
+                let target = if c.relative && !follows {
+                    particle.birth_matrix.inverse().transform_point3(here) + c.target
+                } else {
+                    c.target
+                };
+                particle.position += (target - particle.position) * c.strength * particle.scale[3];
+            }
+            particle.diff = particle.position - before;
+        }
     }
 
     /// Move a child emitter's particles one frame, without emitting.
@@ -471,14 +555,7 @@ impl<'a> EmitterSim<'a> {
             statics.gravity_dir_z,
         ) * statics.gravity_scale;
         let air = statics.air_res;
-        for particle in &mut self.particles {
-            particle.position += particle.velocity;
-            particle.diff = particle.velocity;
-            if air != 1.0 {
-                particle.velocity *= air;
-            }
-            particle.velocity += gravity;
-        }
+        self.move_particles(gravity, air);
         self.time += 1.0;
         let now = self.time;
         self.particles.retain(|p| now - 1.0 - p.birth < p.life);
@@ -487,7 +564,8 @@ impl<'a> EmitterSim<'a> {
     /// Each child emitter after this emitter's frame (Smash 0x8d70): its particles age, then it
     /// emits from every live parent particle once the particle is res+0x7f8 percent of its
     /// life old, for res+0x7fc frames when it is a one-time emitter and else for the rest of
-    /// the particle's life, by its own rate and interval. A child particle starts at its parent
+    /// the particle's life, by its own rate and interval, or by the distance the particle moved
+    /// when it emits by distance (res+0x7f2). A child particle starts at its parent
     /// particle, in the parent's space (where the parent particle was born, when it does not
     /// follow the emitter), and takes its velocity (res+0x7d8, times res+0x7e8) and its
     /// colours and opacities (res+0x7dc..0x7df) as they are at that age.
@@ -507,6 +585,7 @@ impl<'a> EmitterSim<'a> {
             let duration = u32_at(raw, 0x7fc) as f32;
             let rate = child.data.emission.rate;
             let rate_random = i32_at(raw, 0x804) as f32 / 100.0;
+            let by_distance = flag(0x7f2);
             for p in 0..self.particles.len() {
                 let age = now - self.particles[p].birth;
                 let start = self.particles[p].life * timing;
@@ -514,45 +593,65 @@ impl<'a> EmitterSim<'a> {
                     continue;
                 }
                 let [timer, interval, accumulated] = self.particles[p].child_emission[index];
-                let mut state = [timer + 1.0, interval, accumulated];
-                if timer >= interval {
+                let (n, state) = if by_distance {
+                    // Smash 0x8d70 hands a child that emits by distance its parent particle's
+                    // last move as the emitter's (emitter+0x3d0), from the particle's second
+                    // frame on, and 0x7c30 emits one particle every res+0x824 of it.
+                    if age == 0.0 {
+                        (0, [timer, interval, accumulated])
+                    } else {
+                        child.emitter_velocity = self.particles[p].diff;
+                        let (n, left) = child.distance_count(accumulated);
+                        (n, [timer, interval, left])
+                    }
+                } else if timer >= interval {
                     let r = child.rng.next();
                     let amount = (accumulated + rate + rate * rate_random * r).max(0.0);
                     let n = amount as usize;
-                    state = [0.0, interval, amount];
                     if n > 0 {
-                        let particle = &self.particles[p];
-                        child.current = if follows {
-                            self.current
-                        } else {
-                            particle.birth_matrix
-                        };
-                        child.spawn_offset = particle.position;
-                        child.spawn_velocity = if flag(0x7d8) {
-                            particle.velocity * f32_at(raw, 0x7e8)
-                        } else {
-                            Vec3::ZERO
-                        };
-                        let mut colours = [child.particle_colour; 2];
-                        for (k, (rgb, alpha)) in [(0x7dc, 0x7de), (0x7dd, 0x7df)].iter().enumerate()
-                        {
-                            let parent = self.colour_at(k, particle, age);
-                            if flag(*rgb) {
-                                colours[k][..3].copy_from_slice(&parent[..3]);
-                            }
-                            if flag(*alpha) {
-                                colours[k][3] = parent[3];
-                            }
+                        (n, [timer - interval + 1.0, interval, amount - n as f32])
+                    } else {
+                        (0, [0.0, interval, amount])
+                    }
+                } else {
+                    (0, [timer + 1.0, interval, accumulated])
+                };
+                let mut state = state;
+                if n > 0 {
+                    // A time emission takes its next interval after the particles (Smash 0x30e0).
+                    let next_interval = !by_distance;
+                    let particle = &self.particles[p];
+                    child.current = if follows {
+                        self.current
+                    } else {
+                        particle.birth_matrix
+                    };
+                    child.spawn_offset = particle.position;
+                    child.spawn_velocity = if flag(0x7d8) {
+                        particle.velocity * f32_at(raw, 0x7e8)
+                    } else {
+                        Vec3::ZERO
+                    };
+                    let mut colours = [child.particle_colour; 2];
+                    for (k, (rgb, alpha)) in [(0x7dc, 0x7de), (0x7dd, 0x7df)].iter().enumerate() {
+                        let parent = self.colour_at(k, particle, age);
+                        if flag(*rgb) {
+                            colours[k][..3].copy_from_slice(&parent[..3]);
                         }
-                        child.spawn_colours = Some(colours);
-                        child.spawn(n);
-                        child.spawn_offset = Vec3::ZERO;
-                        child.spawn_velocity = Vec3::ZERO;
-                        child.spawn_colours = None;
-                        let next = child.next_interval();
-                        state = [timer - interval + 1.0, next, amount - n as f32];
+                        if flag(*alpha) {
+                            colours[k][3] = parent[3];
+                        }
+                    }
+                    child.spawn_colours = Some(colours);
+                    child.spawn(n);
+                    child.spawn_offset = Vec3::ZERO;
+                    child.spawn_velocity = Vec3::ZERO;
+                    child.spawn_colours = None;
+                    if next_interval {
+                        state[1] = child.next_interval();
                     }
                 }
+                child.emitter_velocity = Vec3::ZERO;
                 self.particles[p].child_emission[index] = state;
             }
         }
@@ -641,20 +740,42 @@ impl<'a> EmitterSim<'a> {
         i32_at(self.raw, 0x808) as f32 + 1.0 + draw
     }
 
+    /// A move's length as distance emission counts it (Smash 0x7c30): zero under the margin
+    /// res+0x830, else clamped to res+0x828..res+0x82c.
+    fn distance_step(&self, length: f32) -> f32 {
+        let step = if length >= f32_at(self.raw, 0x830) {
+            length
+        } else {
+            0.0
+        };
+        let (min, max) = (f32_at(self.raw, 0x828), f32_at(self.raw, 0x82c));
+        if step != 0.0 && (step < min || step > max) {
+            step.clamp(min, max)
+        } else {
+            step
+        }
+    }
+
+    /// Distance emission's count from the distance not yet emitted for and the emitter's move
+    /// this frame (emitter+0x3d0): every res+0x824 of the total is one particle. Returns the
+    /// count and what is left over.
+    fn distance_count(&self, carried: f32) -> (usize, f32) {
+        let step = self.distance_step(self.emitter_velocity.length());
+        let unit = f32_at(self.raw, 0x824);
+        let total = carried + step;
+        if unit == 0.0 {
+            return (0, total);
+        }
+        let n = ((total / unit) as i32).max(0);
+        (n as usize, total - n as f32 * unit)
+    }
+
     /// Distance emission (Smash 0x7c30, the res+0x7f2 branch): the distance the emitter moved
     /// this frame (zero under the margin res+0x830, else clamped to res+0x828..res+0x82c) adds
     /// to a running total, and every res+0x824 of it is one particle, placed along the path
     /// from last frame's position to this one.
     fn emit_by_distance(&mut self, moved: Vec3, previous: Vec3) {
-        let length = moved.length();
-        let margin = f32_at(self.raw, 0x830);
-        let raw_step = if length >= margin { length } else { 0.0 };
-        let (min, max) = (f32_at(self.raw, 0x828), f32_at(self.raw, 0x82c));
-        let step = if raw_step != 0.0 && (raw_step < min || raw_step > max) {
-            raw_step.clamp(min, max)
-        } else {
-            raw_step
-        };
+        let step = self.distance_step(moved.length());
         let unit = f32_at(self.raw, 0x824);
         let mut total = self.distance + step;
         if unit != 0.0 {
