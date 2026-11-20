@@ -56,6 +56,12 @@ fn i32_at(b: &[u8], at: usize) -> i32 {
         .unwrap_or(0)
 }
 
+fn u32_at(b: &[u8], at: usize) -> u32 {
+    b.get(at..at + 4)
+        .map(|s| u32::from_le_bytes(s.try_into().unwrap()))
+        .unwrap_or(0)
+}
+
 fn f32_at(b: &[u8], at: usize) -> f32 {
     b.get(at..at + 4)
         .map(|s| f32::from_le_bytes(s.try_into().unwrap()))
@@ -98,6 +104,9 @@ pub struct EmitterSim<'a> {
     particle_colour: [f32; 4],
     /// Distance travelled and not yet emitted for (distance emission).
     distance: f32,
+    /// The next division an equally divided shape emits from when res+0x874 is 2
+    /// (emitter+0x38).
+    divide_counter: i32,
     /// Set when the effect is killed (`EFFECT_OFF_KIND`; the game's fade request).
     killed: bool,
     /// Fade-out after a kill (emitter+0x70): 1 to 0 over res+0x768 frames when res+0x755
@@ -134,6 +143,7 @@ impl<'a> EmitterSim<'a> {
             set_scale: Vec3::ONE,
             particle_colour: [1.0; 4],
             distance: 0.0,
+            divide_counter: 0,
             killed: false,
             fade_out: 1.0,
             finished: false,
@@ -188,14 +198,40 @@ impl<'a> EmitterSim<'a> {
         }
     }
 
+    /// One emission of `count` (Smash 0xb1c0): a draw shared by the whole emission first, then
+    /// each particle. An equally divided circle or line whose divisions are not picked by
+    /// res+0x874 emits every division `count` times (res+0x880 or +0x888, less a random
+    /// percentage res+0x884 or +0x88c of them).
     fn spawn(&mut self, count: usize) {
+        let batch = self.rng.next();
+        let shape = &self.data.shape_info;
+        let divisions = match shape.volume_type {
+            2 => Some((0x880, 0x884)),
+            13 => Some((0x888, 0x88c)),
+            _ => None,
+        };
+        let count = match divisions {
+            Some((n, random)) if i32_at(self.raw, 0x874) == 0 => {
+                let n = u32_at(self.raw, n);
+                let cut = (batch * u32_at(self.raw, random) as f32 * 0.01 * n as f32) as i64;
+                count * (n as i64 - cut).max(0) as usize
+            }
+            _ => count,
+        };
         // The renderer draws at most this many; a rate past it (or a corrupt one) must not
         // grow the particle list without bound.
         let count = count.min(MAX_PARTICLES.saturating_sub(self.particles.len()));
         let data = self.data;
         let velocity = &data.particle_velocity;
         for index in 0..count {
-            let (mut position, normal) = spawn_shape(data, &mut self.rng, index, count);
+            let (mut position, normal) = spawn_shape(
+                data,
+                self.raw,
+                &mut self.rng,
+                &mut self.divide_counter,
+                batch,
+                index,
+            );
             if data.emission.position_random > 0.0 {
                 let jitter =
                     Vec3::new(self.rng.signed(), 0.0, self.rng.signed()).normalize_or_zero();
@@ -538,8 +574,16 @@ fn res_matrix(raw: &[u8], rng: &mut Lcg) -> (Mat4, Mat4) {
     (rt * Mat4::from_scale(scale), rt)
 }
 
-/// Spawn position and outward direction by volume type (g_EmitFunctions order).
-fn spawn_shape(data: &EmitterData, rng: &mut Lcg, index: usize, count: usize) -> (Vec3, Vec3) {
+/// Spawn position and outward direction by volume type (g_EmitFunctions order). `batch` is the
+/// draw the whole emission shares and `index` the particle's place in it.
+fn spawn_shape(
+    data: &EmitterData,
+    raw: &[u8],
+    rng: &mut Lcg,
+    divide_counter: &mut i32,
+    batch: f32,
+    index: usize,
+) -> (Vec3, Vec3) {
     let shape = &data.shape_info;
     let radius = Vec3::new(
         shape.volume_radius_x * shape.volume_form_scale_x.max(0.0),
@@ -554,7 +598,13 @@ fn spawn_shape(data: &EmitterData, rng: &mut Lcg, index: usize, count: usize) ->
     // The sweep is centred on its start angle: sys_atk_smoke's impact3 (start pi, sweep 163
     // degrees) throws its particles backward to both sides in game, read live from the
     // emitter, where a sweep starting at pi would throw half of them forward.
-    let first = shape.sweep_start - sweep * 0.5;
+    // res+0x839: every emission starts its sweep at a random angle (the shared draw).
+    let start = if shape.sweep_start_random != 0 {
+        std::f32::consts::TAU * batch
+    } else {
+        shape.sweep_start
+    };
+    let first = start - sweep * 0.5;
     let circle = |angle: f32, fill: f32| {
         let dir = Vec3::new(angle.sin(), 0.0, angle.cos());
         (dir * radius * fill, dir)
@@ -569,7 +619,44 @@ fn spawn_shape(data: &EmitterData, rng: &mut Lcg, index: usize, count: usize) ->
             };
             circle(angle, fill)
         }
-        2 => circle(first + sweep * index as f32 / count.max(1) as f32, 1.0),
+        2 => {
+            // Smash 0xb3f0: res+0x880 divisions of the sweep (one less on an open arc, so both
+            // ends get one). Which division: the place in the emission (res+0x874 = 0), a random
+            // one (1) or the next in turn (2). Each particle then turns by up to res+0x84c
+            // either way.
+            let sweep = shape.sweep_longitude;
+            let full = sweep == std::f32::consts::TAU;
+            let n = u32_at(raw, 0x880) as i64;
+            let (n, division) = match i32_at(raw, 0x874) {
+                0 => {
+                    let cut = (u32_at(raw, 0x884) as f32 * batch * 0.01 * n as f32) as i64;
+                    let n = n - cut;
+                    (n - i64::from(!full && n > 1), index as i64)
+                }
+                kind => {
+                    let n = n - i64::from(n > 1 && !full);
+                    let division = match kind {
+                        2 => {
+                            let at = *divide_counter as i64;
+                            *divide_counter = if at + 1 < n { at as i32 + 1 } else { 0 };
+                            if n == 0 {
+                                0
+                            } else {
+                                at % n
+                            }
+                        }
+                        1 => (rng.next() * n as f32) as i64,
+                        _ => index as i64,
+                    };
+                    (n, division)
+                }
+            };
+            let n = n.max(1) as f32;
+            let jitter = rng.next() - 0.5;
+            let angle = start + (sweep / n * division as f32 - sweep * 0.5)
+                + shape.volume_surface_pos_rand * 2.0 * jitter;
+            circle(angle, 1.0)
+        }
         4..=7 => {
             let dir = rng.unit_vector();
             let fill = if shape.volume_type == 7 {
@@ -589,14 +676,39 @@ fn spawn_shape(data: &EmitterData, rng: &mut Lcg, index: usize, count: usize) ->
             let position = Vec3::new(rng.signed(), rng.signed(), rng.signed()) * radius;
             (position, position.normalize_or_zero())
         }
+        // Smash 0xd360 and 0xd3f0: along z, centred less half the centre ratio of the length;
+        // the divided line puts its res+0x888 divisions end to end.
         12 | 13 => {
+            let length = shape.line_length;
             let t = if shape.volume_type == 13 {
-                index as f32 / count.max(1) as f32 - 0.5
+                let n = u32_at(raw, 0x888) as i64;
+                let (n, division) = match i32_at(raw, 0x874) {
+                    2 => {
+                        let at = *divide_counter as i64;
+                        *divide_counter = if at + 1 < n { at as i32 + 1 } else { 0 };
+                        (n, if n == 0 { 0 } else { at % n })
+                    }
+                    1 => (n, (rng.next() * n as f32) as i64),
+                    0 => {
+                        let cut = (u32_at(raw, 0x88c) as f32 * batch * 0.01 * n as f32) as i64;
+                        (n - cut, index as i64)
+                    }
+                    _ => (n, index as i64),
+                };
+                if n - 1 == 0 {
+                    0.5
+                } else {
+                    division as f32 / (n - 1) as f32
+                }
             } else {
-                rng.signed() * 0.5
+                rng.next()
             };
             (
-                Vec3::new(0.0, 0.0, shape.line_center + t * shape.line_length),
+                Vec3::new(
+                    0.0,
+                    0.0,
+                    length * t - (length + length * shape.line_center) * 0.5,
+                ),
                 Vec3::Z,
             )
         }

@@ -373,3 +373,96 @@ fn particles_start_at_their_own_initial_rotation() {
         );
     }
 }
+
+/// Runs `f` on a new sim of the emitter `name` in the set `set` of `file` under the game's
+/// effect folder, or returns None when VFX_GAME_EFFECTS is unset.
+fn with_named<T>(
+    file: &str,
+    set: &str,
+    name: &str,
+    f: impl FnOnce(&mut sim::EmitterSim) -> T,
+) -> Option<T> {
+    let root = std::env::var_os("VFX_GAME_EFFECTS")?;
+    let data = std::fs::read(std::path::Path::new(&root).join(file)).unwrap();
+    let eff = effect_library::namco_file::NamcoEffectFile::load(&data).unwrap();
+    let p = eff.ptcl_file.as_ref().unwrap();
+    let set = p
+        .emitter_list
+        .emitter_sets
+        .iter()
+        .position(|s| s.name == set)
+        .unwrap();
+    let index = p.emitter_list.emitter_sets[set]
+        .emitters
+        .iter()
+        .position(|e| e.data.name.as_deref() == Some(name))
+        .unwrap();
+    let raw = &ptcl::emitter_sets(&p.base_bytes)[set].emitters[index];
+    let fixed = static_block::fixed_emitter_data(raw, &|_| None, None);
+    let parsed = &p.emitter_list.emitter_sets[set].emitters[index].data;
+    let mut s = sim::EmitterSim::new(parsed, &fixed);
+    Some(f(&mut s))
+}
+
+/// Directions (radians, about Y in emitter space) the live particles move in.
+fn headings(s: &sim::EmitterSim) -> Vec<f32> {
+    s.streams()
+        .get("sysLocalVecAttr")
+        .map(|v| v.iter().map(|v| v[0].atan2(v[2])).collect())
+        .unwrap_or_default()
+}
+
+/// The ice hit's crystals (P_CmnHitIce crystal1): an equally divided circle of 6 whose
+/// divisions are not picked one at a time (res+0x874 = 0), so one emission of rate 1 throws a
+/// crystal from every division, 60 degrees apart. The preview threw one.
+#[test]
+fn an_equally_divided_circle_emits_every_division() {
+    let Some(mut angles) = with_named(
+        "system/common/ef_common.eff",
+        "P_CmnHitIce",
+        "crystal1",
+        |s| {
+            s.step();
+            headings(s)
+        },
+    ) else {
+        eprintln!("VFX_GAME_EFFECTS not set; skipped");
+        return;
+    };
+    assert_eq!(angles.len(), 6);
+    angles.sort_by(f32::total_cmp);
+    for pair in angles.windows(2) {
+        let step = (pair[1] - pair[0]).to_degrees();
+        assert!((step - 60.0).abs() < 0.01, "{angles:?}");
+    }
+}
+
+/// Sephiroth's charge rays (edge_fire2_hold light2): one ray an emission from a random one of 5
+/// divisions (res+0x874 = 1) of a circle whose start is random each emission (res+0x839),
+/// turned up to 30 degrees either way. Every ray came out of the same division, so the rays
+/// stacked into one upright beam.
+#[test]
+fn equally_divided_rays_point_different_ways() {
+    let Some(angles) = with_named(
+        "fighter/edge/ef_edge.eff",
+        "P_EdgeFire2Hold",
+        "light2",
+        |s| {
+            let mut all = Vec::new();
+            for _ in 0..80 {
+                s.step();
+                all.extend(headings(s));
+            }
+            all
+        },
+    ) else {
+        eprintln!("VFX_GAME_EFFECTS not set; skipped");
+        return;
+    };
+    assert!(angles.len() > 20);
+    let spread = angles
+        .iter()
+        .map(|a| (a - angles[0]).sin().abs())
+        .fold(0.0f32, f32::max);
+    assert!(spread > 0.5, "{angles:?}");
+}
