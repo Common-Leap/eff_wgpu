@@ -466,3 +466,60 @@ fn equally_divided_rays_point_different_ways() {
         .fold(0.0f32, f32::max);
     assert!(spread > 0.5, "{angles:?}");
 }
+
+/// Sephiroth's charge sparks (edge_fire2_hold sparks4) have two child emitters that leave a
+/// trail of dots behind every spark, coloured as the spark is: the game's red and gold streaks.
+/// Child emitters were not run at all, so the sparks drew without their trails.
+#[test]
+fn child_emitters_trail_their_parent_particles() {
+    let Some(root) = std::env::var_os("VFX_GAME_EFFECTS") else {
+        eprintln!("VFX_GAME_EFFECTS not set; skipped");
+        return;
+    };
+    let data = std::fs::read(std::path::Path::new(&root).join("fighter/edge/ef_edge.eff")).unwrap();
+    let eff = effect_library::namco_file::NamcoEffectFile::load(&data).unwrap();
+    let p = eff.ptcl_file.as_ref().unwrap();
+    let set = p
+        .emitter_list
+        .emitter_sets
+        .iter()
+        .position(|s| s.name == "P_EdgeFire2Hold")
+        .unwrap();
+    let index = p.emitter_list.emitter_sets[set]
+        .emitters
+        .iter()
+        .position(|e| e.data.name.as_deref() == Some("sparks4"))
+        .unwrap();
+    let parsed = &p.emitter_list.emitter_sets[set].emitters[index];
+    let raw = &ptcl::emitter_sets(&p.base_bytes)[set].emitters[index];
+    let fixed = static_block::fixed_emitter_data(raw, &|_| None, None);
+    let children: Vec<Vec<u8>> = raw
+        .children
+        .iter()
+        .map(|c| static_block::fixed_emitter_data(c, &|_| None, None))
+        .collect();
+    assert_eq!(parsed.children.len(), 2);
+    let mut s = sim::EmitterSim::new(&parsed.data, &fixed);
+    for (child, fixed) in parsed.children.iter().zip(&children) {
+        s.add_child(&child.data, fixed);
+    }
+    for _ in 0..30 {
+        s.step();
+    }
+    assert!(s.count() > 0);
+    // The sparks start 6 to 30 from the centre and fly in; every dot is where a spark was.
+    for child in s.children() {
+        assert!(child.count() > s.count(), "{} dots", child.count());
+        let streams = child.streams();
+        let radii: Vec<f32> = streams["sysLocalPosAttr"]
+            .iter()
+            .map(|pos| glam::Vec3::new(pos[0], pos[1], pos[2]).length())
+            .collect();
+        assert!(radii.iter().all(|r| *r <= 30.5), "{radii:?}");
+        assert!(radii.iter().any(|r| *r > 3.0), "{radii:?}");
+        // Coloured as the spark is at that age, not the plain white of a new particle.
+        assert!(streams["sysColor0Attr"]
+            .iter()
+            .any(|c| c[..3] != [1.0, 1.0, 1.0]));
+    }
+}
