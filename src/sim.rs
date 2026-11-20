@@ -74,43 +74,7 @@ fn f32_at(b: &[u8], at: usize) -> f32 {
         .unwrap_or(0.0)
 }
 
-/// The field sections (`ptcl::Emitter::attributes`) that move an emitter's particles on the
-/// CPU (EmitterCalculator::CalculateParticleBehavior). Read with [`Fields::of`].
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
-pub struct Fields {
-    /// FCOV: each frame a particle moves `strength` of the way to `target`. With `relative`,
-    /// the target is taken from where the emitter is now (FieldConvergence's second type).
-    pub convergence: Option<Convergence>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Convergence {
-    pub relative: bool,
-    pub target: Vec3,
-    pub strength: f32,
-}
-
-impl Fields {
-    /// The fields an emitter's attribute sections (`ptcl::Emitter::attributes`) hold. FCOV is
-    /// a type byte, the target (+4..+0x10) and the strength (+0x10); an 8-key animation of the
-    /// strength (key count at +0x14) is not run, the constant stands in for it.
-    pub fn of(attributes: &[([u8; 4], Vec<u8>)]) -> Self {
-        let section = |magic: &[u8; 4]| {
-            attributes
-                .iter()
-                .find(|(m, _)| m == magic)
-                .map(|(_, d)| d.as_slice())
-        };
-        let convergence = section(b"FCOV")
-            .filter(|d| d.len() >= 0x14)
-            .map(|d| Convergence {
-                relative: d[0] != 0,
-                target: Vec3::new(f32_at(d, 4), f32_at(d, 8), f32_at(d, 0xc)),
-                strength: f32_at(d, 0x10),
-            });
-        Fields { convergence }
-    }
-}
+pub use crate::field::{Convergence, CurlNoise, Fields, PositionAdd, Spin};
 
 /// Live particles one emitter keeps, the most the renderer draws in one call.
 pub const MAX_PARTICLES: usize = 4096;
@@ -171,6 +135,9 @@ pub struct EmitterSim<'a> {
     fade_out: f32,
     /// The emitter is gone: its fade-out ran out (Calculate returned false).
     finished: bool,
+    /// Effect frames each step advances (emitter+0x4c, the frame step Calculate is handed):
+    /// 1 at normal speed, a quarter in training mode's quarter-speed slow motion.
+    frame_rate: f32,
 }
 
 impl<'a> EmitterSim<'a> {
@@ -210,6 +177,7 @@ impl<'a> EmitterSim<'a> {
             fields: Fields::default(),
             fade_out: 1.0,
             finished: false,
+            frame_rate: 1.0,
         }
     }
 
@@ -226,8 +194,24 @@ impl<'a> EmitterSim<'a> {
     pub fn add_child(&mut self, data: &'a EmitterData, raw: &'a [u8]) -> &mut EmitterSim<'a> {
         let mut child = EmitterSim::new(data, raw);
         child.time = self.time;
+        child.frame_rate = self.frame_rate;
         self.children.push(child);
         self.children.last_mut().unwrap()
+    }
+
+    /// Advance `rate` effect frames a step instead of one (the frame step the game hands
+    /// EmitterCalculator::Calculate, Smash 0x8450): time, emission timers, fades and lives
+    /// count by it, and particles move that share of their velocity and fields. The game's
+    /// slow motion runs effects so: at a quarter, a particle's move in one step (what the
+    /// shaders stretch sparks by) and what a child inherits from it are a quarter as long.
+    /// Child emitters added later take the rate too.
+    pub fn set_frame_rate(&mut self, rate: f32) {
+        if rate.is_finite() && rate > 0.0 {
+            self.frame_rate = rate;
+            for child in &mut self.children {
+                child.set_frame_rate(rate);
+            }
+        }
     }
 
     /// Run the emitter's field sections on its particles (see [`Fields`]). Without this they
@@ -437,7 +421,7 @@ impl<'a> EmitterSim<'a> {
             self.fade_in = if frames < 1 {
                 1.0
             } else {
-                (self.fade_in + 1.0 / frames as f32).min(1.0)
+                (self.fade_in + self.frame_rate / frames as f32).min(1.0)
             };
         }
         let raw = self.raw;
@@ -450,7 +434,7 @@ impl<'a> EmitterSim<'a> {
                 self.fade_out = if frames < 1 {
                     -1.0
                 } else {
-                    self.fade_out - 1.0 / frames as f32
+                    self.fade_out - self.frame_rate / frames as f32
                 };
                 if self.fade_out < 0.0 {
                     self.fade_out = 0.0;
@@ -459,8 +443,9 @@ impl<'a> EmitterSim<'a> {
                 }
             }
         }
+        let step = self.frame_rate;
         if self.finished {
-            self.time += 1.0;
+            self.time += step;
             self.step_children();
             return;
         }
@@ -494,10 +479,10 @@ impl<'a> EmitterSim<'a> {
                     self.spawn(n as usize);
                     self.interval = self.next_interval();
                     self.accumulated -= n as f32;
-                    self.timer = (self.timer - interval) + 1.0;
+                    self.timer = (self.timer - interval) + step;
                 }
             } else {
-                self.timer += 1.0;
+                self.timer += step;
             }
         }
         self.previous_translation = Some(translation);
@@ -509,38 +494,62 @@ impl<'a> EmitterSim<'a> {
         ) * statics.gravity_scale;
         let air = statics.air_res;
         self.move_particles(gravity, air);
-        self.time += 1.0;
+        self.time += step;
         // A particle draws `life` times, the frame it is born included: the game ages and
         // removes particles before it emits, so a new one always reaches the screen (live
         // probe: sys_attack_arc_b's arccylinder1, life 1, draws once; arccylinder2, life 3,
-        // three times). The draw after this step reads time `now - 1`.
+        // three times). The draw after this step reads time `now - step`.
         let now = self.time;
-        self.particles.retain(|p| now - 1.0 - p.birth < p.life);
+        self.particles.retain(|p| now - step - p.birth < p.life);
         self.step_children();
     }
 
-    /// One frame of motion for every particle (CalculateParticleBehavior): position by
-    /// velocity, then air resistance and gravity on the velocity, then the field sections.
+    /// One frame of motion for every particle (CalculateParticleBehavior, Smash 0xf9f0):
+    /// position by velocity times the particle's motion scale (its scale stream's w, which
+    /// res+0x8c0 spreads), then air resistance and gravity on the velocity, then the field
+    /// sections.
     fn move_particles(&mut self, gravity: Vec3, air: f32) {
         let follows = self.raw.get(0x753).copied().unwrap_or(0) != 1;
         let here = self.current.w_axis.truncate();
+        let life = i32_at(self.raw, 0x8b8) as f32;
+        let fields = self.fields;
+        let run_fields = !fields.is_empty();
+        let rate = self.frame_rate;
+        // Air resistance per frame, compounded over the share of a frame a step is.
+        let air = if rate == 1.0 { air } else { air.powf(rate) };
         for particle in &mut self.particles {
             let before = particle.position;
-            particle.position += particle.velocity;
+            let motion = particle.scale[3] * rate;
+            particle.position += particle.velocity * motion;
             if air != 1.0 {
                 particle.velocity *= air;
             }
-            particle.velocity += gravity;
-            // FieldConvergence: a share of the way to the target each frame, times the
-            // particle's scale w. Sephiroth's charge sparks (0.11 a frame to the centre) speed
-            // in from as far as 30 away; without it they crept in at their own 1 a frame.
-            if let Some(c) = self.fields.convergence {
-                let target = if c.relative && !follows {
-                    particle.birth_matrix.inverse().transform_point3(here) + c.target
+            particle.velocity += gravity * rate;
+            if run_fields {
+                let matrix = if follows {
+                    self.current
                 } else {
-                    c.target
+                    particle.birth_matrix
                 };
-                particle.position += (target - particle.position) * c.strength * particle.scale[3];
+                // FieldConvergence's second type aims at where the emitter is now; a particle
+                // that follows the emitter is already in its space, where that is the origin.
+                let emitter_here = if follows {
+                    Vec3::ZERO
+                } else {
+                    particle.birth_matrix.inverse().transform_point3(here)
+                };
+                fields.apply(crate::field::Particle {
+                    position: &mut particle.position,
+                    velocity: &mut particle.velocity,
+                    age: self.time - particle.birth,
+                    life,
+                    random: particle.random[0],
+                    motion,
+                    frame_rate: rate,
+                    time: self.time,
+                    matrix,
+                    emitter_here,
+                });
             }
             particle.diff = particle.position - before;
         }
@@ -556,9 +565,10 @@ impl<'a> EmitterSim<'a> {
         ) * statics.gravity_scale;
         let air = statics.air_res;
         self.move_particles(gravity, air);
-        self.time += 1.0;
+        let rate = self.frame_rate;
+        self.time += rate;
         let now = self.time;
-        self.particles.retain(|p| now - 1.0 - p.birth < p.life);
+        self.particles.retain(|p| now - rate - p.birth < p.life);
     }
 
     /// Each child emitter after this emitter's frame (Smash 0x8d70): its particles age, then it
@@ -573,7 +583,8 @@ impl<'a> EmitterSim<'a> {
         if self.children.is_empty() {
             return;
         }
-        let now = self.time - 1.0;
+        let step = self.frame_rate;
+        let now = self.time - step;
         let follows = self.raw.get(0x753).copied().unwrap_or(0) != 1;
         let mut children = std::mem::take(&mut self.children);
         for (index, child) in children.iter_mut().enumerate() {
@@ -609,12 +620,12 @@ impl<'a> EmitterSim<'a> {
                     let amount = (accumulated + rate + rate * rate_random * r).max(0.0);
                     let n = amount as usize;
                     if n > 0 {
-                        (n, [timer - interval + 1.0, interval, amount - n as f32])
+                        (n, [timer - interval + step, interval, amount - n as f32])
                     } else {
                         (0, [0.0, interval, amount])
                     }
                 } else {
-                    (0, [timer + 1.0, interval, accumulated])
+                    (0, [timer + step, interval, accumulated])
                 };
                 let mut state = state;
                 if n > 0 {
@@ -842,12 +853,12 @@ impl<'a> EmitterSim<'a> {
         // The game draws a frame before its time advances: after the spawn frame's Calculate
         // the dynamic block holds time 0 and the fade-in has already taken its first step
         // (live capture: time 4 with fade 5/6). `self.time` counts steps taken, one ahead.
-        v[8] = (self.time - 1.0).max(0.0);
+        v[8] = (self.time - self.frame_rate).max(0.0);
         v[9] = self.particles.len() as f32;
         // MakeDynamicConstantBuffer's param_2 and frame step: 0 and 1 for an ordinary draw
         // (captured: the game's fireball disc block reads (time, count, 0, 1)).
         v[10] = 0.0;
-        v[11] = 1.0;
+        v[11] = self.frame_rate;
         // MakeDynamicConstantBuffer: the fade-in where res+0x75b / 0x75c asks for it, times
         // the fade-out after a kill where res+0x755 / 0x756 does.
         let on = |flag: usize| r.get(flag).copied().unwrap_or(0) != 0;

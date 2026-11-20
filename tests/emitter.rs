@@ -658,7 +658,11 @@ fn a_convergence_field_pulls_particles_to_its_target() {
     let radii = |with_fields: bool| {
         let mut s = sim::EmitterSim::new(&parsed.data, &fixed);
         if with_fields {
-            s.set_fields(fields);
+            // The convergence alone: sparks4's curl noise bends the same paths.
+            s.set_fields(sim::Fields {
+                convergence: fields.convergence,
+                ..Default::default()
+            });
         }
         for _ in 0..25 {
             s.step();
@@ -677,4 +681,255 @@ fn a_convergence_field_pulls_particles_to_its_target() {
         assert!(b < a, "{plain:?} {pulled:?}");
     }
     assert!(mean(&pulled) < mean(&plain) * 0.7, "{plain:?} {pulled:?}");
+}
+
+/// The raw attribute sections of the emitter `name` in `set` of `file`, beside a sim of it.
+fn with_fields<T>(
+    file: &str,
+    set: &str,
+    name: &str,
+    f: impl FnOnce(&effect_library::emitter::EmitterData, &[u8], sim::Fields) -> T,
+) -> Option<T> {
+    let root = std::env::var_os("VFX_GAME_EFFECTS")?;
+    let data = std::fs::read(std::path::Path::new(&root).join(file)).unwrap();
+    let eff = effect_library::namco_file::NamcoEffectFile::load(&data).unwrap();
+    let p = eff.ptcl_file.as_ref().unwrap();
+    let set = p
+        .emitter_list
+        .emitter_sets
+        .iter()
+        .position(|s| s.name == set)
+        .unwrap();
+    let index = p.emitter_list.emitter_sets[set]
+        .emitters
+        .iter()
+        .position(|e| e.data.name.as_deref() == Some(name))
+        .unwrap();
+    let raw = &ptcl::emitter_sets(&p.base_bytes)[set].emitters[index];
+    let fixed = static_block::fixed_emitter_data(raw, &|_| None, None);
+    let parsed = &p.emitter_list.emitter_sets[set].emitters[index].data;
+    Some(f(parsed, &fixed, sim::Fields::of(&raw.attributes)))
+}
+
+/// Positions and births of the live particles after `steps` frames with `fields`.
+fn run_with(
+    data: &effect_library::emitter::EmitterData,
+    raw: &[u8],
+    fields: sim::Fields,
+    steps: usize,
+) -> Vec<(glam::Vec3, f32)> {
+    let mut s = sim::EmitterSim::new(data, raw);
+    s.set_fields(fields);
+    for _ in 0..steps {
+        s.step();
+    }
+    let streams = s.streams();
+    streams["sysLocalPosAttr"]
+        .iter()
+        .zip(&streams["sysLocalVecAttr"])
+        .map(|(p, v)| (glam::Vec3::new(p[0], p[1], p[2]), v[3]))
+        .collect()
+}
+
+/// Sephiroth's charge dots (edge_fire2_hold sparks2) carry a spin field (FSPN): 3 degrees a
+/// frame about the emitter's Y axis, drawing in half a unit a frame. In game a dot 21 units out
+/// was 13 units out six frames later, curving as it went; without the field it barely moved.
+#[test]
+fn a_spin_field_turns_particles_about_its_axis_and_draws_them_in() {
+    let Some((fields, plain, spun)) = with_fields(
+        "fighter/edge/ef_edge.eff",
+        "P_EdgeFire2Hold",
+        "sparks2",
+        |data, raw, fields| {
+            let only_spin = sim::Fields {
+                spin: fields.spin,
+                ..Default::default()
+            };
+            (
+                fields,
+                run_with(data, raw, sim::Fields::default(), 12),
+                run_with(data, raw, only_spin, 12),
+            )
+        },
+    ) else {
+        eprintln!("VFX_GAME_EFFECTS not set; skipped");
+        return;
+    };
+    let spin = fields.spin.expect("sparks2 has a spin field");
+    assert_eq!(spin.axis, 1);
+    assert!((spin.speed + 0.05236).abs() < 1e-4, "{}", spin.speed);
+    assert!((spin.outward + 0.5).abs() < 1e-6);
+    let noise = fields.curl_noise.expect("sparks2 has a curl noise field");
+    assert_eq!(noise.power, glam::Vec3::splat(0.2));
+    assert_eq!(plain.len(), spun.len());
+    assert!(plain.len() > 5);
+    // The same particles: each has turned by 3 degrees and come in by half a unit for every
+    // frame it has lived, give or take its own small drift.
+    let mut checked = 0;
+    for ((a, birth), (b, _)) in plain.iter().zip(&spun) {
+        let frames = 12.0 - birth;
+        let (ra, rb) = (a.x.hypot(a.z), b.x.hypot(b.z));
+        if frames < 3.0 || ra < 10.0 {
+            continue;
+        }
+        let turned = (b.z.atan2(b.x) - a.z.atan2(a.x) + std::f32::consts::PI)
+            .rem_euclid(std::f32::consts::TAU)
+            - std::f32::consts::PI;
+        assert!(
+            (turned - spin.speed * frames).abs() < 0.03 * frames,
+            "{frames} frames turned {turned}"
+        );
+        assert!(
+            (ra - rb - 0.5 * frames).abs() < 0.25 * frames,
+            "{frames} frames: {ra} -> {rb}"
+        );
+        checked += 1;
+    }
+    assert!(checked >= 3, "{checked}");
+}
+
+/// Sephiroth's charge sparks (sparks4) carry a curl noise field (FCLN) of power 1: each frame a
+/// spark's velocity gains the noise at its position, so its path bends; it does not jump.
+#[test]
+fn a_curl_noise_field_bends_velocities_by_its_power() {
+    let Some((plain, bent)) = with_fields(
+        "fighter/edge/ef_edge.eff",
+        "P_EdgeFire2Hold",
+        "sparks4",
+        |data, raw, fields| {
+            let only_noise = sim::Fields {
+                curl_noise: fields.curl_noise,
+                ..Default::default()
+            };
+            let velocities = |fields| {
+                let mut s = sim::EmitterSim::new(data, raw);
+                s.set_fields(fields);
+                for _ in 0..22 {
+                    s.step();
+                }
+                s.streams()["sysLocalVecAttr"]
+                    .iter()
+                    .map(|v| (glam::Vec3::new(v[0], v[1], v[2]), v[3]))
+                    .collect::<Vec<_>>()
+            };
+            (velocities(sim::Fields::default()), velocities(only_noise))
+        },
+    ) else {
+        eprintln!("VFX_GAME_EFFECTS not set; skipped");
+        return;
+    };
+    assert_eq!(plain.len(), bent.len());
+    assert!(!plain.is_empty());
+    let mut changed = 0;
+    for ((a, birth), (b, _)) in plain.iter().zip(&bent) {
+        let frames = 22.0 - birth;
+        let gained = (*b - *a).length();
+        // At most the table's largest cell (1.3) a frame.
+        assert!(gained <= 1.3 * frames + 1e-4, "{frames}: {gained}");
+        if gained > 0.01 {
+            changed += 1;
+        }
+    }
+    assert!(changed * 2 >= plain.len(), "{changed} of {}", plain.len());
+}
+
+/// A particle moves by its velocity times its own motion scale (Smash 0xf9f0), the scale
+/// stream's w, which res+0x8c0 spreads: Bomberman's finishing sparks (spread 0.5) fly at half
+/// to one and a half times their speed. 971 game emitters spread it; the preview moved every
+/// particle at the same speed.
+#[test]
+fn particles_move_by_their_own_motion_scale() {
+    let Some(rows) = with_named(
+        "assist/bomberman/ef_bomberman.eff",
+        "P_BombermanBombFinish",
+        "spark2_small",
+        |s| {
+            s.step();
+            let streams = s.streams();
+            streams["sysLocalDiffAttr"]
+                .iter()
+                .zip(&streams["sysLocalVecAttr"])
+                .zip(&streams["sysScaleAttr"])
+                .map(|((d, v), w)| (d[0], v[0], w[3]))
+                .collect::<Vec<_>>()
+        },
+    ) else {
+        eprintln!("VFX_GAME_EFFECTS not set; skipped");
+        return;
+    };
+    // Gravity pulls along y only and air resistance (0.91) scales the velocity after the
+    // move, so along x the first frame's move is the velocity now / 0.91 times w.
+    let air = 0.91;
+    let mut spread = (f32::MAX, f32::MIN);
+    let mut checked = 0;
+    for (diff, velocity, w) in rows {
+        if velocity.abs() < 1e-3 {
+            continue;
+        }
+        assert!(
+            (diff / (velocity / air) - w).abs() < 1e-3,
+            "{diff} {velocity} {w}"
+        );
+        spread = (spread.0.min(w), spread.1.max(w));
+        checked += 1;
+    }
+    assert!(checked >= 3, "{checked}");
+    assert!(spread.1 - spread.0 > 0.2, "{spread:?}");
+    assert!(spread.0 >= 0.5 && spread.1 <= 1.5, "{spread:?}");
+}
+
+/// Training mode's quarter-speed slow motion runs the game's effects a quarter of a frame a
+/// step, smoothly (the reference video of Sephiroth's charge changes on every video frame). Four
+/// steps at a quarter make the same particles, near where one step at full rate puts them,
+/// but each step's move, which the shaders stretch sparks by, is a quarter as long.
+#[test]
+fn a_quarter_frame_rate_moves_the_same_particles_a_quarter_as_far_a_step() {
+    type Run = (f32, Vec<[f32; 4]>, Vec<[f32; 4]>);
+    let Some((full, quarter)) = with_fields(
+        "fighter/edge/ef_edge.eff",
+        "P_EdgeFire2Hold",
+        "sparks2",
+        |data, raw, _| {
+            let run = |rate: f32, steps: usize| -> Run {
+                let mut s = sim::EmitterSim::new(data, raw);
+                s.set_frame_rate(rate);
+                for _ in 0..steps {
+                    s.step();
+                }
+                let streams = s.streams();
+                (
+                    s.time,
+                    streams["sysLocalPosAttr"].clone(),
+                    streams["sysLocalDiffAttr"].clone(),
+                )
+            };
+            (run(1.0, 12), run(0.25, 48))
+        },
+    ) else {
+        eprintln!("VFX_GAME_EFFECTS not set; skipped");
+        return;
+    };
+    assert_eq!(full.0, 12.0);
+    assert_eq!(quarter.0, 12.0);
+    assert_eq!(full.1.len(), quarter.1.len());
+    assert!(full.1.len() > 5);
+    let length = |v: &[f32; 4]| glam::Vec3::new(v[0], v[1], v[2]).length();
+    let mut checked = 0;
+    for ((p1, d1), (p4, d4)) in full
+        .1
+        .iter()
+        .zip(&full.2)
+        .zip(quarter.1.iter().zip(&quarter.2))
+    {
+        let gap = glam::Vec3::new(p1[0] - p4[0], p1[1] - p4[1], p1[2] - p4[2]).length();
+        assert!(gap < 0.2, "{p1:?} {p4:?}");
+        if length(d1) > 0.02 {
+            assert!(
+                (length(d4) / length(d1) - 0.25).abs() < 0.05,
+                "{d1:?} {d4:?}"
+            );
+            checked += 1;
+        }
+    }
+    assert!(checked >= 3, "{checked}");
 }

@@ -3,6 +3,7 @@
 //! each emitter is drawn with its own shader, translated from the Maxwell code in the file.
 
 pub mod bnsh;
+pub mod field;
 pub mod maxwell;
 pub mod mesh;
 pub mod ptcl;
