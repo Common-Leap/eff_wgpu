@@ -1,8 +1,8 @@
 //! The field sections of an emitter (`ptcl::Emitter::attributes`): forces the game applies to
 //! each particle on the CPU after its own motion (EmitterCalculator::CalculateParticleBehavior,
-//! Smash 0xf9f0). In the game's order: spin (FSPN), convergence (FCOV), curl noise (FCLN) and
-//! position add (FPAD). Magnet (FMAG), collision (FCOL) and the two random fields (FRND,
-//! FRN1) are not run.
+//! Smash 0xf9f0). In the game's order: the random noise (FRND), the simple random field (FRN1),
+//! spin (FSPN), convergence (FCOV), curl noise (FCLN) and position add (FPAD). Magnet (FMAG) and
+//! collision (FCOL) are not run.
 
 use std::sync::OnceLock;
 
@@ -139,9 +139,41 @@ pub struct PositionAdd {
     amount_anim: Option<Anim8>,
 }
 
+/// FRND (Smash 0x11ad0): each frame a particle's velocity gains `power` times a smooth noise of
+/// four sine waves, run along its own life from a start its random values pick, so every
+/// particle wanders its own way. Its period is `period` frames.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RandomNoise {
+    /// The noise also runs with the emitter's time (`drift` and `spread` percent of the period),
+    /// from three fixed phases.
+    pub with_time: bool,
+    /// The section's own wave weights and lengths instead of the runtime's.
+    pub own_waves: bool,
+    /// Time along the noise slows as air resistance slows the particle.
+    pub damped: bool,
+    pub power: Vec3,
+    pub period: f32,
+    pub drift: f32,
+    pub spread: f32,
+    pub weights: [f32; 4],
+    pub lengths: [f32; 4],
+    power_anim: Option<Anim8>,
+}
+
+/// FRN1 (Smash 0xf9f0, the res+0x250 branch): every `interval` frames of a particle's life its
+/// velocity gains `power` times the next point of the runtime's cube table.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RandomKick {
+    pub power: Vec3,
+    pub interval: u32,
+    power_anim: Option<Anim8>,
+}
+
 /// The field sections that move an emitter's particles on the CPU. Read with [`Fields::of`].
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct Fields {
+    pub random_noise: Option<RandomNoise>,
+    pub random_kick: Option<RandomKick>,
     pub convergence: Option<Convergence>,
     pub spin: Option<Spin>,
     pub curl_noise: Option<CurlNoise>,
@@ -196,7 +228,33 @@ impl Fields {
                 amount: vec3(d, 4),
                 amount_anim: Anim8::read(d, 0x10),
             });
+        // FRND: mode bytes (+0..+2), power (+4), period (+0x10), drift and spread (+0x14,
+        // +0x18), four wave weights (+0x1c) and lengths (+0x2c), the power's animation (+0x3c).
+        let random_noise = section(b"FRND")
+            .filter(|d| d.len() >= 0x3c)
+            .map(|d| RandomNoise {
+                with_time: d[0] != 0,
+                own_waves: d[1] != 0,
+                damped: d[2] != 0,
+                power: vec3(d, 4),
+                period: u32_at(d, 0x10) as i32 as f32,
+                drift: f32_at(d, 0x14),
+                spread: f32_at(d, 0x18),
+                weights: std::array::from_fn(|k| f32_at(d, 0x1c + 4 * k)),
+                lengths: std::array::from_fn(|k| f32_at(d, 0x2c + 4 * k)),
+                power_anim: Anim8::read(d, 0x3c),
+            });
+        // FRN1: power (+0), interval (+0xc), the power's animation (+0x10).
+        let random_kick = section(b"FRN1")
+            .filter(|d| d.len() >= 0x10)
+            .map(|d| RandomKick {
+                power: vec3(d, 0),
+                interval: u32_at(d, 0xc),
+                power_anim: Anim8::read(d, 0x10),
+            });
         Fields {
+            random_noise,
+            random_kick,
             convergence,
             spin,
             curl_noise,
@@ -219,6 +277,12 @@ pub(crate) struct Particle<'a> {
     pub life: f32,
     /// The particle's first random value.
     pub random: f32,
+    /// All four of its random values (sysRandomAttr).
+    pub randoms: [f32; 4],
+    /// The emitter's random state, whose cube table the simple random field reads.
+    pub rng: &'a mut crate::random::EmitterRandom,
+    /// The emitter's air resistance (res+0xc0), which slows a damped noise's time.
+    pub air: f32,
     /// The particle's motion scale (its scale stream's w) times the frame rate.
     pub motion: f32,
     /// The frame rate alone (curl noise is not scaled by the particle's motion scale).
@@ -236,6 +300,27 @@ impl Fields {
     /// One frame of every field on one particle, in the game's order.
     pub(crate) fn apply(&self, p: Particle) {
         let rate = p.motion;
+        if let Some(n) = self.random_noise {
+            let power = n
+                .power_anim
+                .map_or(n.power, |a| a.at(p.age, p.life, p.random));
+            *p.velocity += power * n.at(p.age, p.time, p.frame_rate, p.air, p.randoms);
+        }
+        if let Some(k) = self.random_kick {
+            // At whole multiples of the interval by the age's whole frames, as the game counts
+            // them (so at a quarter frame rate a kick lands on each of a frame's four steps).
+            let age = p.age as i32 as u32;
+            let due = match k.interval {
+                0 => age == 0,
+                n => age.is_multiple_of(n),
+            };
+            if due {
+                let power = k
+                    .power_anim
+                    .map_or(k.power, |a| a.at(p.age, p.life, p.random));
+                *p.velocity += p.rng.cube() * power;
+            }
+        }
         if let Some(spin) = self.spin {
             let degrees = std::f32::consts::PI / 180.0;
             let speed = spin
@@ -310,6 +395,57 @@ impl Fields {
                 amount
             };
         }
+    }
+}
+
+impl RandomNoise {
+    /// The runtime's waves (Smash 0x12640): weights 4, 3, 2 and 1.5, lengths 0.6, 0.42, 0.23
+    /// and 0.15 of the period.
+    const WEIGHTS: [f32; 4] = [4.0, 3.0, 2.0, 1.5];
+    const LENGTHS: [f32; 4] = [0.6, 0.42, 0.23, 0.15];
+
+    /// The waves at `x` frames along a period (Smash 0x12100).
+    fn waves(&self, x: f32) -> f32 {
+        let (weights, lengths) = if self.own_waves {
+            (self.weights, self.lengths)
+        } else {
+            (Self::WEIGHTS, Self::LENGTHS)
+        };
+        let s = std::f32::consts::TAU / self.period;
+        (0..4)
+            .map(|k| weights[k] * (x * s / lengths[k]).sin())
+            .sum()
+    }
+
+    /// This step's push before `power` (Smash 0x11ad0): the waves' change over the step, at
+    /// the particle's age plus its random values of the period (`randoms`), or with
+    /// `with_time` from three fixed phases moving with the emitter's `time`.
+    pub fn at(&self, age: f32, time: f32, step: f32, air: f32, randoms: [f32; 4]) -> Vec3 {
+        if self.period == 0.0 {
+            return Vec3::ZERO;
+        }
+        let mut t = age;
+        if self.damped {
+            let f = air + (1.0 - step) * (1.0 - air);
+            if f != 1.0 {
+                t = (1.0 - f.powf(age)) / (1.0 - f);
+            }
+        }
+        let period = self.period;
+        let axis = |k: usize| {
+            if !self.with_time {
+                let at = t + randoms[k] * period;
+                return self.waves(at + step) - self.waves(at);
+            }
+            const PHASES: [f32; 3] = [0.0, 0.314_15, 0.926_53];
+            let drift = self.drift / 100.0 * period;
+            let spread = self.spread / 100.0 * period;
+            let start = PHASES[k] * period + (drift * time - spread) + 2.0 * spread * randoms[k];
+            let moved = step * drift;
+            (self.waves(t + start + moved + step) - self.waves(t + start))
+                - (self.waves(start + moved) - self.waves(start))
+        };
+        Vec3::new(axis(0), axis(1), axis(2))
     }
 }
 

@@ -7,6 +7,7 @@ pub mod field;
 pub mod maxwell;
 pub mod mesh;
 pub mod ptcl;
+pub mod random;
 pub mod render;
 pub mod sim;
 pub mod static_block;

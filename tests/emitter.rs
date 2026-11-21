@@ -325,23 +325,26 @@ fn a_particle_draws_on_the_frame_it_is_born_and_for_its_whole_life() {
 
 /// Sephiroth's blue charge (edge_fire2_hold): an emitter's initial rotation comes from its own
 /// rotation fields. It was read from the second sampler's texture scale (1, 1), which turned
-/// every mesh particle 57 degrees about X and Y, so the charge ball was seen side on.
+/// every mesh particle 57 degrees about X and Y, so the charge ball was seen side on. The
+/// stream holds the initial angle alone (InitializeParticle draws nothing for it): the shaders
+/// add the random range (static block 0x710) times the particle's random values. The preview
+/// drew a random angle into the stream as well, so the shaders turned particles twice.
 #[test]
 fn particles_start_at_their_own_initial_rotation() {
     let Some(root) = std::env::var_os("VFX_GAME_EFFECTS") else {
         eprintln!("VFX_GAME_EFFECTS not set; skipped");
         return;
     };
-    let data = std::fs::read(std::path::Path::new(&root).join("fighter/edge/ef_edge.eff")).unwrap();
-    let eff = effect_library::namco_file::NamcoEffectFile::load(&data).unwrap();
-    let p = eff.ptcl_file.as_ref().unwrap();
-    let set = p
-        .emitter_list
-        .emitter_sets
-        .iter()
-        .position(|s| s.name == "P_EdgeFire2Hold")
-        .unwrap();
-    let rotation = |name: &str| {
+    let rotation = |file: &str, set: &str, name: &str| {
+        let data = std::fs::read(std::path::Path::new(&root).join(file)).unwrap();
+        let eff = effect_library::namco_file::NamcoEffectFile::load(&data).unwrap();
+        let p = eff.ptcl_file.as_ref().unwrap();
+        let set = p
+            .emitter_list
+            .emitter_sets
+            .iter()
+            .position(|s| s.name == set)
+            .unwrap();
         let index = p.emitter_list.emitter_sets[set]
             .emitters
             .iter()
@@ -353,25 +356,31 @@ fn particles_start_at_their_own_initial_rotation() {
             &p.emitter_list.emitter_sets[set].emitters[index].data,
             &fixed,
         );
-        for _ in 0..30 {
-            s.step();
-        }
-        s.streams()["sysInitRotateAttr"].clone()
+        s.spawn_from_seed(0x51, 0.0, 40);
+        let range: Vec<f32> = (0..3)
+            .map(|k| f32::from_le_bytes(fixed[0x710 + 4 * k..0x714 + 4 * k].try_into().unwrap()))
+            .collect();
+        let statics = static_block::static_block(&fixed);
+        assert_eq!(&statics[0x710..0x71c], &fixed[0x710..0x71c]);
+        (s.streams()["sysInitRotateAttr"].clone(), range)
     };
+    let edge = "fighter/edge/ef_edge.eff";
     // No initial angle and no random range: no rotation.
-    for particle in rotation("sphere1") {
+    for particle in rotation(edge, "P_EdgeFire2Hold", "sphere1").0 {
         assert_eq!(particle, [0.0; 4]);
     }
-    // Random ranges of 50 degrees about X and a full turn about Y and Z: within them, and not
-    // all alike.
-    let ring = rotation("lightning_ring1_bk");
+    // Random ranges of 50 degrees about X and a full turn about Y and Z, no initial angle: the
+    // stream is zero, the range is the shaders'.
+    let (ring, range) = rotation(edge, "P_EdgeFire2Hold", "lightning_ring1_bk");
     assert!(!ring.is_empty());
-    for [x, y, z, _] in &ring {
-        assert!((0.0..=0.873).contains(x), "{x}");
-        assert!(
-            (0.0..=std::f32::consts::TAU).contains(y) && (0.0..=std::f32::consts::TAU).contains(z)
-        );
-    }
+    assert!((range[0] - 0.873).abs() < 1e-3, "{range:?}");
+    assert!(ring.iter().all(|r| *r == [0.0; 4]), "{ring:?}");
+    // Diddy's popgun chips: half a turn on every axis to start, a full turn of random range.
+    let (chips, range) = rotation("fighter/diddy/ef_diddy.eff", "P_DiddyPopgun", "chip1");
+    assert!(!chips.is_empty());
+    assert!((range[0] - std::f32::consts::TAU).abs() < 1e-3, "{range:?}");
+    let pi = std::f32::consts::PI;
+    assert!(chips.iter().all(|r| *r == [pi, pi, pi, 0.0]), "{chips:?}");
 }
 
 /// Runs `f` on a new sim of the emitter `name` in the set `set` of `file` under the game's
@@ -932,4 +941,572 @@ fn a_quarter_frame_rate_moves_the_same_particles_a_quarter_as_far_a_step() {
         }
     }
     assert!(checked >= 3, "{checked}");
+}
+
+/// Every emitter of a set under the game's effect folder, parsed and with its load-time fixes,
+/// and its children, in the order the set creates them.
+type SetEmitters = Vec<(effect_library::emitter::EmitterData, Vec<u8>, ptcl::Emitter)>;
+
+fn set_emitters(file: &str, set: &str) -> Option<SetEmitters> {
+    let root = std::env::var_os("VFX_GAME_EFFECTS")?;
+    let data = std::fs::read(std::path::Path::new(&root).join(file)).unwrap();
+    let eff = effect_library::namco_file::NamcoEffectFile::load(&data).unwrap();
+    let p = eff.ptcl_file.as_ref().unwrap();
+    let index = p
+        .emitter_list
+        .emitter_sets
+        .iter()
+        .position(|s| s.name == set)
+        .unwrap();
+    let raws = &ptcl::emitter_sets(&p.base_bytes)[index];
+    Some(
+        p.emitter_list.emitter_sets[index]
+            .emitters
+            .iter()
+            .zip(&raws.emitters)
+            .map(|(e, raw)| {
+                let fixed = static_block::fixed_emitter_data(raw, &|_| None, None);
+                (e.data.clone(), fixed, raw.clone())
+            })
+            .collect(),
+    )
+}
+
+/// One named emitter of a set: parsed, fixed and raw.
+fn named(
+    file: &str,
+    set: &str,
+    name: &str,
+) -> Option<(effect_library::emitter::EmitterData, Vec<u8>, ptcl::Emitter)> {
+    set_emitters(file, set)?
+        .into_iter()
+        .find(|(d, _, _)| d.name.as_deref() == Some(name))
+}
+
+fn v3(v: &[f32; 4]) -> glam::Vec3 {
+    glam::Vec3::new(v[0], v[1], v[2])
+}
+
+/// Sephiroth's blue charge (P_EdgeFire2Hold) spawned twice. The game seeds every spawn of a set
+/// anew (EmitterSet::ResetCommon draws the set's seed from its global generator; an emitter of
+/// seed type 0 draws its own, type 1 takes the set's), so a looped or repeated effect never
+/// plays the same particles twice. The preview gave every emitter one fixed seed, and each loop
+/// was a copy of the last.
+#[test]
+fn every_spawn_draws_its_own_particles_as_the_game_seeds_it() {
+    let Some(set) = set_emitters("fighter/edge/ef_edge.eff", "P_EdgeFire2Hold") else {
+        eprintln!("VFX_GAME_EFFECTS not set; skipped");
+        return;
+    };
+    let run = |spawn: Option<u32>| -> Vec<Vec<[f32; 4]>> {
+        let mut seeds = spawn.map(sim::SpawnSeeds::new);
+        set.iter()
+            .map(|(data, fixed, _)| {
+                let mut s = match seeds.as_mut() {
+                    Some(seeds) => sim::EmitterSim::with_seed(data, fixed, seeds.emitter(fixed)),
+                    None => sim::EmitterSim::new(data, fixed),
+                };
+                for _ in 0..20 {
+                    s.step();
+                }
+                let streams = s.streams();
+                streams
+                    .get("sysRandomAttr")
+                    .cloned()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .chain(streams.get("sysLocalPosAttr").cloned().unwrap_or_default())
+                    .collect()
+            })
+            .collect()
+    };
+    // The same spawn plays the same particles, and so does the fixed seed: tests and the first
+    // frame of a move stay repeatable.
+    assert_eq!(run(Some(1)), run(Some(1)));
+    assert_eq!(run(None), run(None));
+    let (a, b) = (run(Some(1)), run(Some(2)));
+    let mut differ = 0;
+    for ((data, fixed, _), (a, b)) in set.iter().zip(a.iter().zip(&b)) {
+        assert!(fixed[0x757] < 2, "{:?} has a fixed seed", data.name);
+        if !a.is_empty() {
+            assert_ne!(a, b, "{:?} played the same particles twice", data.name);
+            differ += 1;
+        }
+    }
+    assert!(differ >= 5, "{differ}");
+}
+
+/// The seed types in one real set (Alucard's transform, P_AlucardTransform): emitters of type 1
+/// share the set's seed and so one sequence; type 0 draw their own; every spawn moves both.
+#[test]
+fn seed_type_one_emitters_share_the_sets_seed() {
+    let Some(set) = set_emitters("assist/alucard/ef_alucard.eff", "P_AlucardTransform") else {
+        eprintln!("VFX_GAME_EFFECTS not set; skipped");
+        return;
+    };
+    let seeds = |spawn| {
+        let mut s = sim::SpawnSeeds::new(spawn);
+        set.iter()
+            .map(|(_, fixed, _)| (fixed[0x757], s.emitter(fixed)))
+            .collect::<Vec<_>>()
+    };
+    let (a, b) = (seeds(7), seeds(8));
+    let shared: Vec<u32> = a.iter().filter(|(t, _)| *t == 1).map(|(_, s)| *s).collect();
+    let own: Vec<u32> = a.iter().filter(|(t, _)| *t == 0).map(|(_, s)| *s).collect();
+    assert!(shared.len() >= 2 && own.len() >= 2, "{a:?}");
+    assert!(shared.iter().all(|s| *s == shared[0]), "{a:?}");
+    assert!(own.windows(2).all(|w| w[0] != w[1]) && !own.contains(&shared[0]));
+    for ((_, x), (_, y)) in a.iter().zip(&b) {
+        assert_ne!(x, y);
+    }
+}
+
+/// Bowser Jr.'s Final Smash paint (P_KoopajrFinalPaintSplash paintA3) emits 10 a frame for five
+/// frames with a 50% random rate, and its paint never dies. TimeEmit divides the random share
+/// by -100: each check emits 10 * (1 - 0.5 r), 25 to 50 in all. The preview added it, 50 to 75.
+#[test]
+fn a_random_rate_takes_from_the_rate() {
+    let Some((data, fixed, _)) = named(
+        "fighter/koopajr/ef_koopajr.eff",
+        "P_KoopajrFinalPaintSplash",
+        "paintA3",
+    ) else {
+        eprintln!("VFX_GAME_EFFECTS not set; skipped");
+        return;
+    };
+    assert_eq!(
+        (
+            data.emission.rate,
+            i32::from_le_bytes(fixed[0x804..0x808].try_into().unwrap())
+        ),
+        (10.0, 50)
+    );
+    let mut counts = Vec::new();
+    for spawn in 0..40 {
+        let mut s =
+            sim::EmitterSim::with_seed(&data, &fixed, sim::SpawnSeeds::new(spawn).emitter(&fixed));
+        for _ in 0..12 {
+            s.step();
+        }
+        counts.push(s.count());
+    }
+    for n in &counts {
+        assert!((24..=50).contains(n), "{counts:?}");
+    }
+    let mean = counts.iter().sum::<usize>() as f32 / counts.len() as f32;
+    assert!((mean - 37.5).abs() < 4.0, "{mean} {counts:?}");
+}
+
+/// The Darz tear-up sparks (P_DarzTearUpAnger particle1_H) fly up at a diffusion angle of 90
+/// degrees. InitializeParticle spreads the direction over a cap whose height runs evenly from
+/// 1 - angle / 90 to 1: here every way above the horizon, half of them below 30 degrees up. The
+/// preview leant a unit vector times sin(angle) on the direction, which bunched them upward
+/// (and at 180 degrees spread them not at all).
+#[test]
+fn a_diffusion_angle_spreads_directions_over_its_cap() {
+    let Some((data, fixed, _)) = named("boss/darz/ef_darz.eff", "P_DarzTearUpAnger", "particle1_H")
+    else {
+        eprintln!("VFX_GAME_EFFECTS not set; skipped");
+        return;
+    };
+    assert_eq!(data.particle_velocity.diffusion_dir_angle, 90.0);
+    let mut s = sim::EmitterSim::new(&data, &fixed);
+    s.spawn_from_seed(0x1234_5678, 0.0, 1000);
+    let heights: Vec<f32> = s.streams()["sysLocalVecAttr"]
+        .iter()
+        .map(|v| v3(v).normalize().y)
+        .collect();
+    assert_eq!(heights.len(), 1000);
+    let under = heights.iter().filter(|y| **y < -1e-4).count();
+    assert_eq!(under, 0);
+    let mean = heights.iter().sum::<f32>() / heights.len() as f32;
+    let low = heights.iter().filter(|y| **y < 0.5).count();
+    assert!((mean - 0.5).abs() < 0.04, "{mean}");
+    assert!((420..=580).contains(&low), "{low}");
+}
+
+/// Jiro's spin ball (P_JiroNSpin ball1_main_hight) is a point emitter with a position random of
+/// 0.5: InitializeParticle adds a direction from the runtime's table times 0.5, so particles
+/// start on a sphere about the point. The preview jittered them in the XZ plane only.
+#[test]
+fn position_random_scatters_points_over_a_sphere() {
+    let Some((data, fixed, _)) =
+        named("assist/jiro/ef_jiro.eff", "P_JiroNSpin", "ball1_main_hight")
+    else {
+        eprintln!("VFX_GAME_EFFECTS not set; skipped");
+        return;
+    };
+    assert_eq!(data.shape_info.volume_type, 0);
+    let mut s = sim::EmitterSim::new(&data, &fixed);
+    s.spawn_from_seed(99, 0.0, 400);
+    let points: Vec<glam::Vec3> = s.streams()["sysLocalPosAttr"].iter().map(v3).collect();
+    for p in &points {
+        assert!((p.length() - 0.5).abs() < 1e-3, "{p}");
+    }
+    let high = points.iter().filter(|p| p.y.abs() > 0.25).count();
+    assert!((150..=250).contains(&high), "{high}");
+}
+
+/// The Dark Knight's smoke (P_DarknightSmoke smoke2_L) has an XZ diffusion of 0.25: each
+/// particle also flies out across the emitter's Y axis, away from it, at that speed times its
+/// speed random. The preview had no XZ diffusion. Compared here against the same emitter with
+/// the value cleared, which draws the same numbers.
+#[test]
+fn xz_diffusion_pushes_particles_out_from_the_axis() {
+    let Some((data, fixed, _)) = named(
+        "assist/darkknight/ef_darkknight.eff",
+        "P_DarknightSmoke",
+        "smoke2_L",
+    ) else {
+        eprintln!("VFX_GAME_EFFECTS not set; skipped");
+        return;
+    };
+    let xz = f32::from_le_bytes(fixed[0x97c..0x980].try_into().unwrap());
+    assert_eq!(xz, 0.25);
+    let mut cleared = fixed.clone();
+    cleared[0x97c..0x980].copy_from_slice(&0f32.to_le_bytes());
+    let born = |raw: &[u8]| {
+        let mut s = sim::EmitterSim::new(&data, raw);
+        s.spawn_from_seed(5, 0.0, 60);
+        let st = s.streams();
+        (st["sysLocalPosAttr"].clone(), st["sysLocalVecAttr"].clone())
+    };
+    let ((pos, with), (_, without)) = (born(&fixed), born(&cleared));
+    let low = 1.0 - data.particle_velocity.vel_random / 100.0;
+    for ((p, a), b) in pos.iter().zip(&with).zip(&without) {
+        let push = v3(a) - v3(b);
+        let out = glam::Vec3::new(p[0], 0.0, p[2]).normalize();
+        assert!(push.y.abs() < 1e-5, "{push}");
+        assert!(push.normalize().dot(out) > 0.999, "{push} {out}");
+        assert!(
+            (xz * low - 1e-4..=xz + 1e-4).contains(&push.length()),
+            "{push}"
+        );
+    }
+}
+
+/// Mii Gunner's absorber grains (P_MiiGunnerAbsorber Tsubu1) move only by a random velocity of
+/// one unit on each axis (res+0x980), read from the runtime's cube table. The preview had no
+/// such velocity: the grains sat still.
+#[test]
+fn random_velocity_per_axis_comes_from_the_cube_table() {
+    let Some((data, fixed, _)) = named(
+        "fighter/miigunner/ef_miigunner.eff",
+        "P_MiiGunnerAbsorber",
+        "Tsubu1",
+    ) else {
+        eprintln!("VFX_GAME_EFFECTS not set; skipped");
+        return;
+    };
+    let mut s = sim::EmitterSim::new(&data, &fixed);
+    s.spawn_from_seed(3, 0.0, 300);
+    let vel: Vec<glam::Vec3> = s.streams()["sysLocalVecAttr"].iter().map(v3).collect();
+    for v in &vel {
+        assert!(v.abs().max_element() < 1.0 + 1e-4, "{v}");
+    }
+    for axis in 0..3 {
+        let fast = vel.iter().filter(|v| v[axis].abs() > 0.5).count();
+        assert!((100..=200).contains(&fast), "{axis} {fast}");
+    }
+}
+
+/// Corrin's victory sword aura (P_KamuiSwordAuraWin aura1) redraws its own transform after
+/// every emission (res+0x758, Smash 0x30e0): each emission comes from a new spot within half a
+/// unit of its place on each axis. The preview kept the first spot.
+#[test]
+fn an_emitter_that_moves_by_emission_draws_a_new_place_each_time() {
+    let Some((data, fixed, _)) =
+        named("fighter/kamui/ef_kamui.eff", "P_KamuiSwordAuraWin", "aura1")
+    else {
+        eprintln!("VFX_GAME_EFFECTS not set; skipped");
+        return;
+    };
+    assert_eq!(fixed[0x758], 1);
+    let base = glam::Vec3::new(
+        f32::from_le_bytes(fixed[0x770..0x774].try_into().unwrap()),
+        f32::from_le_bytes(fixed[0x774..0x778].try_into().unwrap()),
+        f32::from_le_bytes(fixed[0x778..0x77c].try_into().unwrap()),
+    );
+    let mut s = sim::EmitterSim::new(&data, &fixed);
+    let mut places = Vec::new();
+    for _ in 0..12 {
+        s.step();
+        places.push(s.emitter_srt(&glam::Mat4::IDENTITY).w_axis.truncate());
+    }
+    for p in &places {
+        assert!((*p - base).abs().max_element() <= 0.5 + 1e-4, "{p} {base}");
+    }
+    let mut distinct = places.clone();
+    distinct.dedup();
+    assert!(distinct.len() >= 8, "{places:?}");
+}
+
+/// Bomberman's bomb sparks (P_BombermanBomb spark1) carry the simple random field (FRN1): every
+/// five frames of a spark's life (from its first) its velocity gains a point of the runtime's
+/// cube table times 0.13. The preview did not run it, and every spark flew straight. Each
+/// spark's velocity is followed from frame to frame (by its random values), less what air
+/// resistance and gravity did: what is left is the field's kick.
+#[test]
+fn the_simple_random_field_kicks_velocities_every_interval() {
+    let Some((data, fixed, raw)) = named(
+        "assist/bomberman/ef_bomberman.eff",
+        "P_BombermanBomb",
+        "spark1",
+    ) else {
+        eprintln!("VFX_GAME_EFFECTS not set; skipped");
+        return;
+    };
+    let fields = sim::Fields::of(&raw.attributes);
+    let kick = fields.random_kick.expect("FRN1");
+    assert_eq!((kick.power.x, kick.interval), (0.13, 5));
+    assert!(fields.random_noise.is_none() && fields.spin.is_none() && fields.convergence.is_none());
+    assert!(fields.curl_noise.is_none() && fields.position_add.is_none());
+    let statics = &data.emitter_static;
+    let gravity = glam::Vec3::new(
+        statics.gravity_dir_x,
+        statics.gravity_dir_y,
+        statics.gravity_dir_z,
+    ) * statics.gravity_scale;
+    let mut s = sim::EmitterSim::new(&data, &fixed);
+    s.set_fields(fields);
+    let mut last: std::collections::HashMap<[u32; 4], glam::Vec3> = Default::default();
+    let (mut kicked, mut quiet) = (0, 0);
+    for _ in 0..16 {
+        let before = s.time;
+        s.step();
+        let st = s.streams();
+        let (Some(random), Some(vec)) = (st.get("sysRandomAttr"), st.get("sysLocalVecAttr")) else {
+            continue;
+        };
+        let mut now = std::collections::HashMap::new();
+        for (r, v) in random.iter().zip(vec) {
+            let id = r.map(f32::to_bits);
+            let birth = v[3];
+            let v = v3(v);
+            if let Some(prev) = last.get(&id) {
+                let age = before - birth;
+                let left = v - (*prev * statics.air_res + gravity);
+                if (age as u32).is_multiple_of(5) {
+                    assert!(left.abs().max_element() <= 0.13 + 1e-4, "{left} at {age}");
+                    kicked += usize::from(left.length() > 1e-3);
+                } else {
+                    assert!(left.length() < 1e-4, "{left} at {age}");
+                    quiet += 1;
+                }
+            }
+            now.insert(id, v);
+        }
+        last = now;
+    }
+    assert!(kicked >= 3 && quiet >= 10, "{kicked} {quiet}");
+}
+
+/// The Rathalos fireball's back flare (P_LioleusFireBall flare_back) carries the random noise
+/// field (FRND, Smash 0x11ad0): each particle's velocity follows four sine waves along its own
+/// life, from a start its random values pick, so each wanders its own way. The preview did not
+/// run it.
+#[test]
+fn the_random_noise_field_moves_each_particle_its_own_way() {
+    let Some((data, fixed, raw)) = named(
+        "assist/lioleus/ef_lioleus.eff",
+        "P_LioleusFireBall",
+        "flare_back",
+    ) else {
+        eprintln!("VFX_GAME_EFFECTS not set; skipped");
+        return;
+    };
+    let fields = sim::Fields::of(&raw.attributes);
+    let noise = fields.random_noise.expect("FRND");
+    assert!(
+        noise.period > 0.0 && noise.power.length() > 0.0,
+        "{noise:?}"
+    );
+    // The noise draws nothing, so with it and without it the same particles are born.
+    assert!(fields.random_kick.is_none());
+    let run = |fields: sim::Fields| {
+        let mut s = sim::EmitterSim::new(&data, &fixed);
+        s.set_fields(fields);
+        s.spawn_from_seed(77, 0.0, 12);
+        for _ in 0..6 {
+            s.step();
+        }
+        s.streams()["sysLocalVecAttr"].clone()
+    };
+    let (noisy, plain) = (run(fields), run(sim::Fields::default()));
+    assert_eq!(noisy.len(), plain.len());
+    assert!(noisy.len() >= 4, "{}", noisy.len());
+    let pushes: Vec<glam::Vec3> = noisy
+        .iter()
+        .zip(&plain)
+        .map(|(a, b)| v3(a) - v3(b))
+        .collect();
+    // Same births either way.
+    for (a, b) in noisy.iter().zip(&plain) {
+        assert_eq!(a[3], b[3]);
+    }
+    assert!(
+        pushes.iter().all(|p| p.length() > 1e-4),
+        "{:?}",
+        &pushes[..4]
+    );
+    assert!(
+        pushes.windows(2).all(|w| (w[0] - w[1]).length() > 1e-4),
+        "{:?}",
+        &pushes[..4]
+    );
+}
+
+/// Shares of particles that start within half the shape's size (`size` gives a particle's
+/// distance out as a share of it), from 2000 at one seed.
+fn inner_share(file: &str, set: &str, name: &str, size: impl Fn(glam::Vec3) -> f32) -> Option<f32> {
+    let (data, fixed, _) = named(file, set, name)?;
+    let mut s = sim::EmitterSim::new(&data, &fixed);
+    s.spawn_from_seed(0xbeef, 0.0, 2000);
+    let points: Vec<glam::Vec3> = s.streams()["sysLocalPosAttr"].iter().map(v3).collect();
+    assert_eq!(points.len(), 2000);
+    Some(points.iter().filter(|p| size(**p) < 0.5).count() as f32 / points.len() as f32)
+}
+
+/// Fills spread like the game's. The Kawasaki plate's circle fill (caliber 1, radius 2) takes
+/// the square root of an even share of the area (Smash 0xb6f0): a quarter within half the
+/// radius. The Thwomp's smoke sphere fill (caliber 1, radius 15.5) takes sqrt(r) of the radius
+/// (Smash 0xc890): a quarter too. The preview put half of each inside half the radius.
+#[test]
+fn filled_circles_and_spheres_spread_like_the_game() {
+    let Some(circle) = inner_share(
+        "assist/kawasaki/ef_kawasaki.eff",
+        "P_KawasakiPlate",
+        "P_plate1",
+        |p| p.length() / 2.0,
+    ) else {
+        eprintln!("VFX_GAME_EFFECTS not set; skipped");
+        return;
+    };
+    assert!((circle - 0.25).abs() < 0.03, "{circle}");
+    let sphere = inner_share("assist/dossun/ef_dossun.eff", "P_DossunIn", "smoke2", |p| {
+        p.length() / 15.5
+    })
+    .unwrap();
+    assert!((sphere - 0.25).abs() < 0.03, "{sphere}");
+}
+
+/// Inkling Shiokarazu's ground splash (P_ShiokarazuFootKimiiro P_ground_G) fills a box 60 by 50
+/// by 10 with a caliber of 0.5: hollow inside half its size (Smash 0xd140). The preview filled
+/// it right through.
+#[test]
+fn a_filled_box_with_a_caliber_stays_out_of_its_hollow() {
+    let Some(inner) = inner_share(
+        "assist/shiokarazu/ef_shiokarazu.eff",
+        "P_ShiokarazuFootKimiiro",
+        "P_ground_G",
+        |p| (p / glam::Vec3::new(60.0, 50.0, 10.0)).abs().max_element(),
+    ) else {
+        eprintln!("VFX_GAME_EFFECTS not set; skipped");
+        return;
+    };
+    assert!(inner < 0.001, "{inner}");
+}
+
+/// The Hebigarasu smoke stones (P_HebigarasuSmoke stone2) fly out of a sphere with a latitude
+/// of 90 degrees about +Y: every direction above the horizon (Smash 0xb9d0). The preview threw
+/// half of them down.
+#[test]
+fn a_sphere_with_a_latitude_keeps_to_its_cap() {
+    let Some((data, fixed, _)) = named(
+        "assist/hebigarasu/ef_hebigarasu.eff",
+        "P_HebigarasuSmoke",
+        "stone2",
+    ) else {
+        eprintln!("VFX_GAME_EFFECTS not set; skipped");
+        return;
+    };
+    assert_eq!(
+        (data.shape_info.volume_type, fixed[0x83a], fixed[0x83e]),
+        (4, 1, 2)
+    );
+    let mut s = sim::EmitterSim::new(&data, &fixed);
+    s.spawn_from_seed(11, 0.0, 500);
+    let points: Vec<glam::Vec3> = s.streams()["sysLocalPosAttr"].iter().map(v3).collect();
+    // Its position random (res+0x810) scatters each stone a little about its place.
+    let scatter = f32::from_le_bytes(fixed[0x810..0x814].try_into().unwrap());
+    let below = points.iter().filter(|p| p.y < -scatter - 1e-3).count();
+    let above = points.iter().filter(|p| p.y > 0.0).count();
+    assert_eq!(below, 0, "scatter {scatter}");
+    assert!(above >= 470, "{above}");
+}
+
+/// Kirby's Final Smash stars (P_KirbyFinalStarB star1) pick their colour from four keys by
+/// each star's random value (colour type 3), and their trail (star1_Child) takes the star's
+/// colour. effect_library reads type 3 as Unknown(3) (it calls type 1 Random, which no game file
+/// uses), so every trail took the star's constant colour instead of its key.
+#[test]
+fn a_child_takes_its_parents_random_colour_key() {
+    let Some(root) = std::env::var_os("VFX_GAME_EFFECTS") else {
+        eprintln!("VFX_GAME_EFFECTS not set; skipped");
+        return;
+    };
+    let data =
+        std::fs::read(std::path::Path::new(&root).join("fighter/kirby/ef_kirby.eff")).unwrap();
+    let eff = effect_library::namco_file::NamcoEffectFile::load(&data).unwrap();
+    let p = eff.ptcl_file.as_ref().unwrap();
+    let set = p
+        .emitter_list
+        .emitter_sets
+        .iter()
+        .position(|s| s.name == "P_KirbyFinalStarB")
+        .unwrap();
+    let index = p.emitter_list.emitter_sets[set]
+        .emitters
+        .iter()
+        .position(|e| e.data.name.as_deref() == Some("star1"))
+        .unwrap();
+    let parsed = &p.emitter_list.emitter_sets[set].emitters[index];
+    let raw = &ptcl::emitter_sets(&p.base_bytes)[set].emitters[index];
+    let fixed = static_block::fixed_emitter_data(raw, &|_| None, None);
+    let child_fixed = static_block::fixed_emitter_data(&raw.children[0], &|_| None, None);
+    assert_eq!(parsed.children[0].data.name.as_deref(), Some("star1_Child"));
+    assert_eq!(
+        (
+            parsed.data.particle_color.color0_type.as_u8(),
+            child_fixed[0x7dc]
+        ),
+        (3, 1)
+    );
+    let keys: Vec<[f32; 3]> = parsed.data.emitter_static.color0.keys
+        [..parsed.data.emitter_static.num_color0_keys as usize]
+        .iter()
+        .map(|k| [k.x, k.y, k.z])
+        .collect();
+    let distinct_keys = {
+        let mut k = keys.clone();
+        k.dedup();
+        k.len()
+    };
+    assert!(distinct_keys >= 2, "{keys:?}");
+    let mut s = sim::EmitterSim::new(&parsed.data, &fixed);
+    s.add_child(&parsed.children[0].data, &child_fixed);
+    let mut colours: Vec<[f32; 3]> = Vec::new();
+    for _ in 0..40 {
+        s.step();
+        if let Some(c) = s.children()[0].streams().get("sysColor0Attr") {
+            colours.extend(c.iter().map(|c| [c[0], c[1], c[2]]));
+        }
+    }
+    assert!(colours.len() >= 10, "{}", colours.len());
+    let emitter =
+        |k: usize| f32::from_le_bytes(fixed[0x7ac + 4 * k..0x7b0 + 4 * k].try_into().unwrap());
+    let near = |a: [f32; 3], b: [f32; 3]| (0..3).all(|k| (a[k] - b[k] * emitter(k)).abs() < 1e-4);
+    for c in &colours {
+        assert!(
+            keys.iter().any(|k| near(*c, *k)),
+            "{c:?} is none of {keys:?}"
+        );
+    }
+    let mut seen: Vec<[f32; 3]> = Vec::new();
+    for c in &colours {
+        if !seen.contains(c) {
+            seen.push(*c);
+        }
+    }
+    assert!(seen.len() >= 2, "{seen:?}");
 }

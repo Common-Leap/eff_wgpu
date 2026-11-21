@@ -8,31 +8,9 @@
 use std::collections::HashMap;
 
 use effect_library::emitter::EmitterData;
-use glam::{Mat4, Vec3};
+use glam::{Mat4, Quat, Vec2, Vec3};
 
-/// The runtime's emitter LCG (emitter+0xac): value * 2^-32, then step.
-#[derive(Debug, Clone)]
-pub struct Lcg(pub u32);
-
-impl Lcg {
-    pub fn next(&mut self) -> f32 {
-        let value = self.0;
-        self.0 = self.0.wrapping_mul(0x41c6_4e6d).wrapping_add(0x3039);
-        value as f32 * (1.0 / 4_294_967_296.0)
-    }
-    pub fn signed(&mut self) -> f32 {
-        self.next() * 2.0 - 1.0
-    }
-    fn unit_vector(&mut self) -> Vec3 {
-        loop {
-            let v = Vec3::new(self.signed(), self.signed(), self.signed());
-            let length = v.length();
-            if length > 1e-4 && length <= 1.0 {
-                return v / length;
-            }
-        }
-    }
-}
+pub use crate::random::{EmitterRandom, Lcg, SpawnSeeds};
 
 #[derive(Debug, Clone)]
 struct Live {
@@ -84,7 +62,7 @@ pub struct EmitterSim<'a> {
     data: &'a EmitterData,
     /// The emitter's data after load-time fixes (`static_block::fixed_emitter_data`).
     raw: &'a [u8],
-    rng: Lcg,
+    rng: EmitterRandom,
     /// Emitter time (emitter+0x44).
     pub time: f32,
     /// Fade-in (emitter+0x74): 0 to 1 over res+0x76c frames when res+0x75b (alpha) or
@@ -141,9 +119,18 @@ pub struct EmitterSim<'a> {
 }
 
 impl<'a> EmitterSim<'a> {
+    /// The emitter with its fixed seed (res+0x760, as seed type 2 gives it), whatever its seed
+    /// type: the same particles every time. A preview that plays an effect more than once wants
+    /// [`EmitterSim::with_seed`] and a [`SpawnSeeds`] for each spawn, as the game seeds them.
     pub fn new(data: &'a EmitterData, raw: &'a [u8]) -> Self {
-        let mut rng = Lcg(seed(raw));
-        let (local, local_rt) = res_matrix(raw, &mut rng);
+        Self::with_seed(data, raw, crate::random::fixed_seed(raw))
+    }
+
+    /// The emitter as Emitter::Initialize starts it from `seed` (Random::SetSeed): its
+    /// transform takes the first draws, its particles the rest.
+    pub fn with_seed(data: &'a EmitterData, raw: &'a [u8], seed: u32) -> Self {
+        let mut rng = EmitterRandom::seeded(seed);
+        let (local, local_rt) = res_matrix(raw, &mut rng.lcg);
         Self {
             data,
             raw,
@@ -192,7 +179,17 @@ impl<'a> EmitterSim<'a> {
     /// Add a child emitter (`data` parsed, `raw` after load-time fixes): it emits from every
     /// live particle of this emitter, as the game's child emitters do (Smash 0x8d70).
     pub fn add_child(&mut self, data: &'a EmitterData, raw: &'a [u8]) -> &mut EmitterSim<'a> {
-        let mut child = EmitterSim::new(data, raw);
+        self.add_child_with_seed(data, raw, crate::random::fixed_seed(raw))
+    }
+
+    /// [`EmitterSim::add_child`] with the child's seed (see [`SpawnSeeds`]).
+    pub fn add_child_with_seed(
+        &mut self,
+        data: &'a EmitterData,
+        raw: &'a [u8],
+        seed: u32,
+    ) -> &mut EmitterSim<'a> {
+        let mut child = EmitterSim::with_seed(data, raw, seed);
         child.time = self.time;
         child.frame_rate = self.frame_rate;
         self.children.push(child);
@@ -246,10 +243,10 @@ impl<'a> EmitterSim<'a> {
     /// does at emitter time `time`, and return the generator state afterwards. For checking the
     /// spawn port against generator states read from the running game.
     pub fn spawn_from_seed(&mut self, seed: u32, time: f32, count: usize) -> u32 {
-        self.rng = Lcg(seed);
+        self.rng = EmitterRandom::seeded(seed);
         self.time = time;
         self.spawn(count);
-        self.rng.0
+        self.rng.lcg.0
     }
 
     /// Set the particle colour (`LAST_PARTICLE_SET_COLOR`): red, green, blue and opacity.
@@ -289,53 +286,63 @@ impl<'a> EmitterSim<'a> {
         // grow the particle list without bound.
         let count = count.min(MAX_PARTICLES.saturating_sub(self.particles.len()));
         let data = self.data;
+        let raw = self.raw;
         let velocity = &data.particle_velocity;
+        let vec3_at =
+            |at: usize| Vec3::new(f32_at(raw, at), f32_at(raw, at + 4), f32_at(raw, at + 8));
         for index in 0..count {
+            // InitializeParticle (Smash 0xa2d0), its draws in the game's order. The shape's
+            // place and outward direction, the direction at the all-direction speed.
             let (mut position, normal) = spawn_shape(
                 data,
-                self.raw,
+                raw,
                 &mut self.rng,
                 &mut self.divide_counter,
                 batch,
                 index,
             );
+            let mut outward = normal * velocity.all_direction;
+            // XZ diffusion (res+0x97c): outward across the emitter's Y axis from its centre, a
+            // random way for a particle on the axis.
+            let xz = f32_at(raw, 0x97c);
+            if xz != 0.0 {
+                let mut flat = Vec2::new(position.x, position.z);
+                if flat.length_squared() <= f32::EPSILON {
+                    flat = Vec2::new(self.rng.signed(), self.rng.signed());
+                }
+                outward += Vec3::new(flat.x, 0.0, flat.y).normalize_or_zero() * xz;
+            }
+            // The speed's random share (res+0x98c), drawn here whether or not it is used.
+            let speed = 1.0 - self.rng.next() * velocity.vel_random / 100.0;
+            // Position random (res+0x810): that far out a direction of the runtime's table.
+            let scatter = f32_at(raw, 0x810);
+            if scatter != 0.0 {
+                position += self.rng.unit() * scatter;
+            }
             position += self.spawn_offset;
-            if data.emission.position_random > 0.0 {
-                let jitter =
-                    Vec3::new(self.rng.signed(), 0.0, self.rng.signed()).normalize_or_zero();
-                position += jitter * data.emission.position_random;
-            }
-            let mut direction = Vec3::new(
-                velocity.designated_dir_x,
-                velocity.designated_dir_y,
-                velocity.designated_dir_z,
-            )
-            .normalize_or_zero();
-            if velocity.diffusion_dir_angle > 0.0 && direction != Vec3::ZERO {
-                let spread = velocity.diffusion_dir_angle.to_radians();
-                direction = (direction + self.rng.unit_vector() * spread.sin()).normalize_or_zero();
-            }
-            let mut vel =
-                normal * velocity.all_direction + direction * velocity.designated_dir_scale;
-            vel *= 1.0 - self.rng.next() * velocity.vel_random / 100.0;
-            // InitializeParticle (Smash 0xa2d0): plus the emitter's own movement (emitter+0x3d0)
-            // times res+0x990. Sephiroth's charge sparks drop gold dots that drift in after
-            // them (0.2), so each trail stretches as it goes.
-            vel += self.emitter_velocity * f32_at(self.raw, 0x990);
-            vel += self.spawn_velocity;
-            // Life (InitializeParticle): life * (1 - randint(0..=life_random) / 100), or
-            // 2^28 frames when infinite.
-            let raw = self.raw;
-            let life = if raw.get(0x8a8).copied().unwrap_or(0) != 0 {
-                268_435_456.0
+            // The designated direction (res+0x96c), spread by the diffusion angle (res+0x978,
+            // degrees) over a cap about it: two draws, the turn about it and the height on the
+            // cap, which runs linearly from 1 - angle / 90 to 1 (a whole sphere at 180).
+            let designated = vec3_at(0x96c);
+            let angle = f32_at(raw, 0x978);
+            let along = if angle == 0.0 {
+                designated
             } else {
-                let spread = i32_at(raw, 0x8bc);
-                let draw = ((self.rng.0 as u64 * spread.max(0) as u64) >> 32) as f32;
-                self.rng.next();
-                i32_at(raw, 0x8b8) as f32 * (1.0 - draw * 0.01)
+                let around = self.rng.next() * std::f32::consts::TAU;
+                let low = 1.0 - angle / 90.0;
+                let height = low + (1.0 - low) * self.rng.next();
+                let ring = (1.0 - height * height).max(0.0).sqrt();
+                from_y(designated) * Vec3::new(ring * around.cos(), height, ring * around.sin())
             };
-            // Scale: base (0x130..) * emitter scale (0x9c0..) * (1 - random% / 100 * r); one draw
-            // for every axis when the x and y percentages match.
+            let mut vel = (outward + along * velocity.designated_dir_scale) * speed;
+            // Random velocity per axis (res+0x980) from the cube table, then the emitter's own
+            // movement (emitter+0x3d0) times res+0x990: Sephiroth's charge sparks drop gold
+            // dots that drift in after them (0.2), so each trail stretches as it goes.
+            vel += self.rng.cube() * vec3_at(0x980);
+            vel += self.emitter_velocity * f32_at(raw, 0x990);
+            vel += self.spawn_velocity;
+            // Scale: base (0x9c0..) * (1 - random% / 100 * r); one draw for every axis when the
+            // x and y percentages match.
             let (px, py, pz) = (f32_at(raw, 0x9cc), f32_at(raw, 0x9d0), f32_at(raw, 0x9d4));
             let factors = if px == py {
                 let f = 1.0 - px / 100.0 * self.rng.next();
@@ -355,26 +362,30 @@ impl<'a> EmitterSim<'a> {
                 f32_at(raw, 0x9c8) * factors[2],
                 w,
             ];
+            // Life: life * (1 - randint(0..life_random) / 100), or 2^28 frames when infinite.
+            let life = if raw.get(0x8a8).copied().unwrap_or(0) != 0 {
+                268_435_456.0
+            } else {
+                let draw = self.rng.below(i32_at(raw, 0x8bc));
+                i32_at(raw, 0x8b8) as f32 * (1.0 - draw * 0.01)
+            };
             let random = [
                 self.rng.next(),
                 self.rng.next(),
                 self.rng.next(),
                 self.rng.next(),
             ];
-            // InitRotate: the initial angle (0x700..) plus its random range (0x710..) times a
-            // draw, each axis cleared at load when that axis does not rotate. These offsets
-            // were 0x320.., the second sampler's texture scale (1, 1), which turned every mesh
-            // particle 57 degrees about X and Y: Sephiroth's charge ball was seen side on.
-            let mut rotate = [0.0f32; 4];
-            for (axis, angle) in rotate.iter_mut().take(3).enumerate() {
-                let range = f32_at(raw, 0x710 + 4 * axis);
-                *angle = f32_at(raw, 0x700 + 4 * axis)
-                    + if range != 0.0 {
-                        range * self.rng.next()
-                    } else {
-                        0.0
-                    };
-            }
+            // InitRotate: the initial angle (0x700..), each axis cleared at load when that axis
+            // does not rotate. No draw: the shaders add the random range (static block 0x710)
+            // times the particle's random values. These offsets were 0x320.., the second
+            // sampler's texture scale (1, 1), which turned every mesh particle 57 degrees about
+            // X and Y: Sephiroth's charge ball was seen side on.
+            let rotate = [
+                f32_at(raw, 0x700),
+                f32_at(raw, 0x704),
+                f32_at(raw, 0x708),
+                0.0,
+            ];
             self.particles.push(Live {
                 position,
                 velocity: vel,
@@ -461,7 +472,9 @@ impl<'a> EmitterSim<'a> {
         let active = may_emit
             && frame >= start
             && (!emission.is_one_time || frame < start + emission.duration.max(1) as f32);
-        // Rate randomness and interval spread are integers in the file (res+0x804, +0x80c).
+        // Rate randomness and interval spread are whole percentages and frames in the file
+        // (res+0x804, +0x80c). The random share takes from the rate: TimeEmit divides it by
+        // -100, so a 100% random rate of 1 emits between none and one a check.
         let rate_random = i32_at(self.raw, 0x804) as f32 / 100.0;
         if active && self.raw.get(0x7f2).copied().unwrap_or(0) != 0 {
             self.emit_by_distance(moved, previous);
@@ -469,7 +482,7 @@ impl<'a> EmitterSim<'a> {
             // Time emission (Smash 0x7c30, the res+0x7f2 == 0 branch).
             if self.timer >= self.interval {
                 let r = self.rng.next();
-                let rate = emission.rate + emission.rate * rate_random * r;
+                let rate = emission.rate - emission.rate * rate_random * r;
                 self.accumulated = (self.accumulated + rate).max(0.0);
                 let n = self.accumulated as i32;
                 if n == 0 {
@@ -478,6 +491,7 @@ impl<'a> EmitterSim<'a> {
                     let interval = self.interval;
                     self.spawn(n as usize);
                     self.interval = self.next_interval();
+                    self.update_matrix_by_emit();
                     self.accumulated -= n as f32;
                     self.timer = (self.timer - interval) + step;
                 }
@@ -544,6 +558,9 @@ impl<'a> EmitterSim<'a> {
                     age: self.time - particle.birth,
                     life,
                     random: particle.random[0],
+                    randoms: particle.random,
+                    rng: &mut self.rng,
+                    air: f32_at(self.raw, 0xc0),
                     motion,
                     frame_rate: rate,
                     time: self.time,
@@ -617,7 +634,7 @@ impl<'a> EmitterSim<'a> {
                     }
                 } else if timer >= interval {
                     let r = child.rng.next();
-                    let amount = (accumulated + rate + rate * rate_random * r).max(0.0);
+                    let amount = (accumulated + rate - rate * rate_random * r).max(0.0);
                     let n = amount as usize;
                     if n > 0 {
                         (n, [timer - interval + step, interval, amount - n as f32])
@@ -660,6 +677,7 @@ impl<'a> EmitterSim<'a> {
                     child.spawn_colours = None;
                     if next_interval {
                         state[1] = child.next_interval();
+                        child.update_matrix_by_emit();
                     }
                 }
                 child.emitter_velocity = Vec3::ZERO;
@@ -725,7 +743,9 @@ impl<'a> EmitterSim<'a> {
                         a.z + (b.z - a.z) * f,
                     ])
                 }
-                ColorType::Random if !keys.is_empty() => {
+                // Type 3 picks a key by the particle's first random value. effect_library calls
+                // type 1 Random, which no game file uses; 3 reads as Unknown(3).
+                ColorType::Unknown(3) | ColorType::Random if !keys.is_empty() => {
                     let i = ((particle.random[0] * keys.len() as f32) as usize).min(keys.len() - 1);
                     Some(at(&keys[i]))
                 }
@@ -745,10 +765,17 @@ impl<'a> EmitterSim<'a> {
     /// The next emission interval after an emission (Smash 0x30e0): res+0x808 frames plus one
     /// plus a random whole number below res+0x80c.
     fn next_interval(&mut self) -> f32 {
-        let spread = i32_at(self.raw, 0x80c).max(0) as u64;
-        let draw = ((self.rng.0 as u64 * spread) >> 32) as f32;
-        self.rng.next();
+        let draw = self.rng.below(i32_at(self.raw, 0x80c));
         i32_at(self.raw, 0x808) as f32 + 1.0 + draw
+    }
+
+    /// After a time emission's interval (Smash 0x30e0): when res+0x758 asks, the emitter's own
+    /// transform is drawn again with its random spreads (six draws, as CreateResMatrix), so
+    /// each emission comes from a new place and angle.
+    fn update_matrix_by_emit(&mut self) {
+        if self.raw.get(0x758).copied().unwrap_or(0) != 0 {
+            (self.local, self.local_rt) = res_matrix(self.raw, &mut self.rng.lcg);
+        }
     }
 
     /// A move's length as distance emission counts it (Smash 0x7c30): zero under the margin
@@ -881,13 +908,6 @@ impl<'a> EmitterSim<'a> {
     }
 }
 
-/// The emitter's random seed (Emitter::Initialize): res+0x757 picks fixed (2: res+0x760 times
-/// 0xdfdc1c35), the set's seed (1) or the global generator (0). The last two differ per spawn
-/// in game; the fixed formula stands in for them so a preview is repeatable.
-fn seed(raw: &[u8]) -> u32 {
-    (i32_at(raw, 0x760) as u32).wrapping_mul(0xdfdc_1c35)
-}
-
 /// Emitter::CreateResMatrix (Smash 0x2c80): rotation res+0x788 + res+0x794 * (2r - 1) per axis,
 /// translation res+0x770 + res+0x77c * (2r - 1), scale res+0x7a0; six draws, rotation first.
 /// The rows it writes are the columns of T * Rz * Ry * Rx * S.
@@ -910,12 +930,25 @@ fn res_matrix(raw: &[u8], rng: &mut Lcg) -> (Mat4, Mat4) {
     (rt * Mat4::from_scale(scale), rt)
 }
 
+/// The rotation that turns +Y to `to` (the shortest one; half a turn about X when `to` points
+/// down), as InitializeParticle and the sphere shapes build it.
+fn from_y(to: Vec3) -> Quat {
+    let to = to.normalize_or_zero();
+    if to == Vec3::ZERO {
+        Quat::IDENTITY
+    } else if to.y <= -1.0 + 1e-6 {
+        Quat::from_rotation_x(std::f32::consts::PI)
+    } else {
+        Quat::from_rotation_arc(Vec3::Y, to)
+    }
+}
+
 /// Spawn position and outward direction by volume type (g_EmitFunctions order). `batch` is the
 /// draw the whole emission shares and `index` the particle's place in it.
 fn spawn_shape(
     data: &EmitterData,
     raw: &[u8],
-    rng: &mut Lcg,
+    rng: &mut EmitterRandom,
     divide_counter: &mut i32,
     batch: f32,
     index: usize,
@@ -945,16 +978,67 @@ fn spawn_shape(
         let dir = Vec3::new(angle.sin(), 0.0, angle.cos());
         (dir * radius * fill, dir)
     };
-    match shape.volume_type {
-        1 | 3 => {
-            let angle = first + rng.next() * sweep;
-            let fill = if shape.volume_type == 3 {
-                1.0 - shape.caliber_ratio * rng.next()
+    // Circle fill (Smash 0xb6f0): a draw for the angle, then one for the distance out, the
+    // square root of a uniform share of the ring's area between 1 - caliber and 1; the
+    // direction leans to the longer axis of an oval.
+    let circle_fill = |rng: &mut EmitterRandom| {
+        let angle = first + rng.next() * sweep;
+        let inner = 1.0 - shape.caliber_ratio;
+        let r = rng.next();
+        let fill = (r + (1.0 - r) * inner * inner).max(0.0).sqrt();
+        let (sin, cos) = angle.sin_cos();
+        let (mut x, mut z) = (sin * fill, cos * fill);
+        if radius.x <= radius.z {
+            x *= if radius.z != 0.0 {
+                radius.x / radius.z
             } else {
-                1.0
+                0.0
             };
-            circle(angle, fill)
+        } else {
+            z *= radius.z / radius.x;
         }
+        let dir = Vec3::new(x, 0.0, z).try_normalize().unwrap_or(Vec3::Z);
+        (
+            Vec3::new(sin * fill * radius.x, 0.0, cos * fill * radius.z),
+            dir,
+        )
+    };
+    // Sphere and sphere fill (Smash 0xb9d0, 0xc890): a draw for the angle about the axis (the
+    // swept longitude, or a whole turn with a latitude, Smash 0xd810), one for the height
+    // (all of -1..1, or from cos(latitude) to 1 about the latitude axis res+0x83e).
+    let sphere = |rng: &mut EmitterRandom| {
+        // The runtime reads res+0x83a for this (effect_library calls it arc_type).
+        let latitude = raw.get(0x83a).copied() == Some(1);
+        let angle = if latitude {
+            rng.next() * std::f32::consts::TAU
+        } else {
+            first + rng.next() * sweep
+        };
+        let height = if latitude {
+            1.0 - rng.next() * (1.0 - f32_at(raw, 0x844).cos())
+        } else {
+            rng.signed()
+        };
+        let ring = (1.0 - height * height).max(0.0).sqrt();
+        let mut dir = Vec3::new(ring * angle.sin(), height, ring * angle.cos());
+        if latitude {
+            let axis = match shape.volume_latitude_dir {
+                0 => Vec3::X,
+                1 => Vec3::NEG_X,
+                3 => Vec3::NEG_Y,
+                4 => Vec3::Z,
+                5 => Vec3::NEG_Z,
+                _ => Vec3::Y,
+            };
+            dir = from_y(axis) * dir;
+        }
+        dir
+    };
+    match shape.volume_type {
+        // Point (Smash 0xb1d0): no place, a direction from the runtime's table.
+        0 => (Vec3::ZERO, rng.unit()),
+        1 => circle(first + rng.next() * sweep, 1.0),
+        3 => circle_fill(rng),
         2 => {
             // Smash 0xb3f0: res+0x880 divisions of the sweep (one less on an open arc, so both
             // ends get one). Which division: the place in the emission (res+0x874 = 0), a random
@@ -994,23 +1078,55 @@ fn spawn_shape(
                 + shape.volume_surface_pos_rand * 2.0 * jitter;
             circle(angle, 1.0)
         }
-        4..=7 => {
-            let dir = rng.unit_vector();
-            let fill = if shape.volume_type == 7 {
-                1.0 - shape.caliber_ratio * rng.next()
-            } else {
-                1.0
-            };
+        // The equally divided spheres (5, 6) take their directions from the runtime's tables
+        // of 32 and 64; these draw them as a sphere does.
+        4..=6 => {
+            let dir = sphere(rng);
+            (dir * radius, dir)
+        }
+        7 => {
+            let dir = sphere(rng);
+            let fill = rng.next().sqrt() * shape.caliber_ratio + 1.0 - shape.caliber_ratio;
             (dir * radius * fill, dir)
         }
+        // Cylinder and its fill (Smash 0xce80, 0xcf10): the circle, then a height.
         8 | 9 => {
-            let angle = first + rng.next() * sweep;
-            let (mut position, dir) = circle(angle, 1.0);
+            let (mut position, dir) = if shape.volume_type == 9 {
+                circle_fill(rng)
+            } else {
+                circle(first + rng.next() * sweep, 1.0)
+            };
             position.y = rng.signed() * radius.y;
             (position, dir)
         }
-        10 | 11 => {
+        10 => {
             let position = Vec3::new(rng.signed(), rng.signed(), rng.signed()) * radius;
+            (position, position.normalize_or_zero())
+        }
+        // Box fill (Smash 0xd140): a draw picks which of the hollow box's slabs, three place
+        // the point in it and three more flip each axis.
+        11 => {
+            let inner = 1.0 - shape.caliber_ratio;
+            let inner = if inner == 1.0 { 0.999 } else { inner };
+            let pick = rng.next() * (1.0 - inner * inner * inner);
+            let mut p = Vec3::new(rng.next(), rng.next(), rng.next());
+            let outer = 1.0 - inner;
+            if pick < outer {
+                p.y = inner + outer * p.y;
+            } else if pick < outer + inner * outer {
+                p.x = inner + outer * p.x;
+                p.y *= inner;
+            } else {
+                p.x *= inner;
+                p.y *= inner;
+                p.z = inner + outer * p.z;
+            }
+            for axis in 0..3 {
+                if rng.next() < 0.5 {
+                    p[axis] = -p[axis];
+                }
+            }
+            let position = p * radius;
             (position, position.normalize_or_zero())
         }
         // Smash 0xd360 and 0xd3f0: along z, centred less half the centre ratio of the length;
@@ -1053,6 +1169,6 @@ fn spawn_shape(
             Vec3::new(rng.signed() * radius.x, 0.0, rng.signed() * radius.z),
             Vec3::Y,
         ),
-        _ => (Vec3::ZERO, rng.unit_vector()),
+        _ => (Vec3::ZERO, rng.unit()),
     }
 }
