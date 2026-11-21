@@ -323,7 +323,15 @@ impl<'a> EmitterSim<'a> {
             // The designated direction (res+0x96c), spread by the diffusion angle (res+0x978,
             // degrees) over a cap about it: two draws, the turn about it and the height on the
             // cap, which runs linearly from 1 - angle / 90 to 1 (a whole sphere at 180).
-            let designated = vec3_at(0x96c);
+            // A world-oriented velocity (res+0x7f3) names its direction in the world: the
+            // game takes it through the inverse of the emitter's matrix, so the shaders, which
+            // turn every velocity by that matrix, send the particles that way however the
+            // effect is turned.
+            let designated = if raw.get(0x7f3).copied().unwrap_or(0) != 0 {
+                world_to_emitter(&self.current, vec3_at(0x96c))
+            } else {
+                vec3_at(0x96c)
+            };
             let angle = f32_at(raw, 0x978);
             let along = if angle == 0.0 {
                 designated
@@ -524,6 +532,12 @@ impl<'a> EmitterSim<'a> {
     /// sections.
     fn move_particles(&mut self, gravity: Vec3, air: f32) {
         let follows = self.raw.get(0x753).copied().unwrap_or(0) != 1;
+        // World gravity (res+0x7f1) pulls along the world's axes: the game turns it into the
+        // emitter's space through the emitter's rotation (its matrix without scale, or the one
+        // the particle was born with when particles do not follow the emitter). Otherwise it
+        // pulls along the emitter's own axes, and turns with the effect.
+        let world_gravity = self.raw.get(0x7f1).copied().unwrap_or(0) != 0;
+        let current_gravity = world_gravity_in(&self.current, gravity);
         let here = self.current.w_axis.truncate();
         let life = i32_at(self.raw, 0x8b8) as f32;
         let fields = self.fields;
@@ -538,7 +552,12 @@ impl<'a> EmitterSim<'a> {
             if air != 1.0 {
                 particle.velocity *= air;
             }
-            particle.velocity += gravity * rate;
+            let pull = match (world_gravity, follows) {
+                (false, _) => gravity,
+                (true, true) => current_gravity,
+                (true, false) => world_gravity_in(&particle.birth_matrix, gravity),
+            };
+            particle.velocity += pull * rate;
             if run_fields {
                 let matrix = if follows {
                     self.current
@@ -928,6 +947,23 @@ fn res_matrix(raw: &[u8], rng: &mut Lcg) -> (Mat4, Mat4) {
     let rotate = Mat4::from_euler(glam::EulerRot::ZYX, rotation[2], rotation[1], rotation[0]);
     let rt = Mat4::from_translation(translation) * rotate;
     (rt * Mat4::from_scale(scale), rt)
+}
+
+/// A world direction in the space of an emitter whose matrix is `m` (scale included): through
+/// the matrix's inverse, as InitializeParticle turns a world-oriented velocity (Smash 0xa2d0).
+fn world_to_emitter(m: &Mat4, world: Vec3) -> Vec3 {
+    if m.determinant().abs() > 1e-12 {
+        m.inverse().transform_vector3(world)
+    } else {
+        world
+    }
+}
+
+/// World gravity in the space of an emitter whose matrix is `m`: its component along each of
+/// the matrix's axes, scale taken out (CalculateParticleBehavior, Smash 0xf9f0).
+fn world_gravity_in(m: &Mat4, gravity: Vec3) -> Vec3 {
+    let along = |axis: glam::Vec4| axis.truncate().normalize_or_zero().dot(gravity);
+    Vec3::new(along(m.x_axis), along(m.y_axis), along(m.z_axis))
 }
 
 /// The rotation that turns +Y to `to` (the shortest one; half a turn about X when `to` points

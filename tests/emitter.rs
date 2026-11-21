@@ -1510,3 +1510,204 @@ fn a_child_takes_its_parents_random_colour_key() {
     }
     assert!(seen.len() >= 2, "{seen:?}");
 }
+
+/// A game matrix as the live probe prints it: three rows of (x, y, z, translation).
+fn probe_rows(r: [f32; 12]) -> glam::Mat4 {
+    glam::Mat4::from_cols_array(&[
+        r[0], r[4], r[8], 0.0, r[1], r[5], r[9], 0.0, r[2], r[6], r[10], 0.0, r[3], r[7], r[11],
+        1.0,
+    ])
+}
+
+/// Mario's fireball shoot flame (MARIO_FB_SHOOT fire1) pulls up along the world's Y (world
+/// gravity, res+0x7f1) although the emitter is turned 130 degrees about X and rides his hand.
+/// Read live from the game (sd:/slight/vfx_probe.txt, Mario's neutral special facing right,
+/// ~/.cache/builds/visionary/vfx-re/vfx_place_fb.txt, emitter 0x11e1ae3250): the emitter's
+/// matrix each frame and the particle's velocity in emitter space. Each frame's change, less
+/// the air resistance, is the gravity the game added: almost all of it along the emitter's X,
+/// which the hand points up, and none along its own Y. The preview pulled every emitter along
+/// its own Y, so this flame flowed sideways out of the hand instead of rising.
+#[test]
+fn world_gravity_pulls_along_the_worlds_axes_as_the_game_does() {
+    let Some((data, fixed, _)) = named(
+        "fighter/mario/ef_mario.eff",
+        "P_MarioFireballShoot",
+        "fire1",
+    ) else {
+        eprintln!("VFX_GAME_EFFECTS not set; skipped");
+        return;
+    };
+    assert_eq!(fixed[0x7f1], 1, "fire1 is a world gravity emitter");
+    // Emitter matrices at emitter times 2..7 and the particle's velocity at times 2..8.
+    let matrices = [
+        [
+            -0.100, 1.378, -0.644, -19.738, 1.823, 0.027, -0.278, 8.138, -0.256, -0.601, -1.702,
+            0.168,
+        ],
+        [
+            -0.073, 1.288, -0.627, -19.826, 1.704, -0.002, -0.253, 8.013, -0.240, -0.594, -1.579,
+            0.174,
+        ],
+        [
+            -0.061, 1.214, -0.596, -19.921, 1.607, -0.015, -0.246, 7.930, -0.238, -0.572, -1.486,
+            0.213,
+        ],
+        [
+            -0.058, 1.163, -0.569, -20.001, 1.539, -0.021, -0.250, 7.890, -0.243, -0.553, -1.422,
+            0.263,
+        ],
+        [
+            -0.061, 1.132, -0.551, -20.063, 1.495, -0.023, -0.263, 7.884, -0.255, -0.543, -1.381,
+            0.312,
+        ],
+        [
+            -0.069, 1.110, -0.537, -20.116, 1.463, -0.021, -0.280, 7.903, -0.270, -0.539, -1.352,
+            0.359,
+        ],
+    ]
+    .map(probe_rows);
+    let game = [
+        [-0.047, -0.003, 0.029],
+        [-0.015, -0.002, 0.023],
+        [0.016, -0.002, 0.017],
+        [0.044, -0.002, 0.011],
+        [0.072, -0.002, 0.004],
+        [0.098, -0.003, -0.002],
+        [0.122, -0.002, -0.008],
+    ]
+    .map(glam::Vec3::from);
+    let air = data.emitter_static.air_res;
+    // What gravity added over a frame: the change less the air resistance's share.
+    let pull = |before: glam::Vec3, after: glam::Vec3| after - before * air;
+    let mut s = sim::EmitterSim::new(&data, &fixed);
+    let local = s.emitter_srt(&glam::Mat4::IDENTITY);
+    let set = |m: &glam::Mat4| *m * local.inverse();
+    for _ in 0..10 {
+        if s.count() > 0 {
+            break;
+        }
+        s.step_at(&set(&matrices[0]));
+    }
+    assert!(s.count() > 0);
+    let velocity = |s: &sim::EmitterSim| v3(&s.streams()["sysLocalVecAttr"][0]);
+    for (k, m) in matrices.iter().enumerate().skip(1) {
+        let before = velocity(&s);
+        s.step_at(&set(m));
+        let ours = pull(before, velocity(&s));
+        let theirs = pull(game[k - 1], game[k]);
+        assert!(
+            (ours - theirs).length() < 0.004,
+            "frame {}: preview adds {ours}, the game {theirs}",
+            k + 2
+        );
+    }
+}
+
+/// The fireball's flame trail (MARIO_FB_BULLET_R fire1) does not follow its emitter (res+0x753
+/// = 1): each flame stays where it was born while the fireball rolls on. Its world gravity is
+/// turned into the flame's space by the emitter's matrix at the flame's birth, not the one the
+/// rolling fireball has now. Read live from the game (vfx_place_fb.txt, emitter 0x11e1ae4b10):
+/// the flame born at time 2 under the first matrix keeps taking that matrix's share of gravity
+/// while the fireball turns 60 degrees more over the next two frames.
+#[test]
+fn world_gravity_of_a_particle_left_behind_turns_by_its_birth_matrix() {
+    let Some((data, fixed, _)) = named(
+        "fighter/mario/ef_mario.eff",
+        "P_MarioFireballBulletR",
+        "fire1",
+    ) else {
+        eprintln!("VFX_GAME_EFFECTS not set; skipped");
+        return;
+    };
+    assert_eq!((fixed[0x7f1], fixed[0x753]), (1, 1));
+    let matrices = [
+        [
+            -0.000, 0.748, 0.664, -17.504, 0.000, 0.664, -0.748, 7.333, -1.000, -0.000, -0.000,
+            -0.000,
+        ],
+        [
+            -0.000, 0.978, 0.207, -15.710, 0.000, 0.207, -0.978, 5.968, -1.000, -0.000, -0.000,
+            -0.000,
+        ],
+        [
+            -0.000, 0.938, -0.346, -14.403, 0.000, -0.346, -0.938, 4.329, -1.000, -0.000, 0.000,
+            -0.000,
+        ],
+    ]
+    .map(probe_rows);
+    // The first flame's velocity at times 2, 3 and 4.
+    let game = [
+        [-0.159, -0.208, -0.350],
+        [-0.154, -0.189, -0.355],
+        [-0.149, -0.170, -0.359],
+    ]
+    .map(glam::Vec3::from);
+    let air = data.emitter_static.air_res;
+    let pull = |before: glam::Vec3, after: glam::Vec3| after - before * air;
+    let mut s = sim::EmitterSim::new(&data, &fixed);
+    let local = s.emitter_srt(&glam::Mat4::IDENTITY);
+    let set = |m: &glam::Mat4| *m * local.inverse();
+    // It emits by the distance it travels (res+0x7f2): it comes to the first matrix along the
+    // fireball's path, a frame's move at a time, turned as it is there.
+    assert_eq!(fixed[0x7f2], 1);
+    let step = matrices[1].w_axis - matrices[0].w_axis;
+    for back in (0..8).rev() {
+        let mut at = matrices[0];
+        at.w_axis -= step * back as f32;
+        s.step_at(&set(&at));
+    }
+    assert!(s.count() > 0);
+    let velocity = |s: &sim::EmitterSim| v3(&s.streams()["sysLocalVecAttr"][0]);
+    for (k, m) in matrices.iter().enumerate().skip(1) {
+        let before = velocity(&s);
+        s.step_at(&set(m));
+        let ours = pull(before, velocity(&s));
+        let theirs = pull(game[k - 1], game[k]);
+        assert!(
+            (ours - theirs).length() < 0.004,
+            "frame {}: preview adds {ours}, the game {theirs}",
+            k + 2
+        );
+    }
+}
+
+/// Sephiroth's up special throws its wind (EDGE_OCTASLASH_ARC2 wind2) up the screen however
+/// the move turns the arc: the emitter's velocity is world-oriented (res+0x7f3), so
+/// InitializeParticle (Smash 0xa2d0) takes its designated direction through the inverse of the
+/// emitter's matrix before the shaders turn it back. The move spawns the arc turned 196 degrees
+/// about Z (SpecialHi2, frame 2); taken in the emitter's own space, the wind blew down.
+#[test]
+fn a_world_oriented_velocity_keeps_its_world_direction() {
+    let Some((data, fixed, _)) = named("fighter/edge/ef_edge.eff", "P_EdgeOctaslashArc2", "wind2")
+    else {
+        eprintln!("VFX_GAME_EFFECTS not set; skipped");
+        return;
+    };
+    assert_eq!(fixed[0x7f3], 1);
+    let f = |at: usize| f32::from_le_bytes(fixed[at..at + 4].try_into().unwrap());
+    let designated = glam::Vec3::new(f(0x96c), f(0x970), f(0x974));
+    // The script's turn (-0, -3.5, 196 degrees, X then Y then Z) at the call's size of 1.2.
+    let turn = glam::Quat::from_euler(
+        glam::EulerRot::ZYX,
+        196f32.to_radians(),
+        (-3.5f32).to_radians(),
+        0.0,
+    );
+    let set =
+        glam::Mat4::from_scale_rotation_translation(glam::Vec3::splat(1.2), turn, glam::Vec3::ZERO);
+    let mut s = sim::EmitterSim::new(&data, &fixed);
+    for _ in 0..10 {
+        if s.count() > 0 {
+            break;
+        }
+        s.step_at(&set);
+    }
+    assert!(s.count() > 0);
+    let srt = s.emitter_srt(&set);
+    // Its own spreads (outward speed, random velocity) lean it a little off the direction.
+    for v in &s.streams()["sysLocalVecAttr"] {
+        let world = srt.transform_vector3(v3(v));
+        let along = world.normalize().dot(designated.normalize());
+        assert!(along > 0.9, "{world} does not blow along {designated}");
+    }
+}
