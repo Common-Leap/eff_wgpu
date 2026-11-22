@@ -100,8 +100,13 @@ pub struct EmitterSim<'a> {
     divide_counter: i32,
     /// Child emitters: each emits from every live particle of this one.
     children: Vec<EmitterSim<'a>>,
-    /// Where a child's next particles start, in its parent emitter's space, and the colours
-    /// they take from the parent particle.
+    /// For a child emitter, its parent's own transform in the set (with scale and without) and
+    /// whether the parent's particles keep their birth matrix (parent res+0x753 = 1), which
+    /// leaves the child in the world on its own transform alone (Smash 0x8090).
+    parent: Option<(Mat4, Mat4, bool)>,
+    /// Where a child's next particles start (its parent particle's position, in the child's
+    /// space, or in the world when the parent's particles keep their birth matrix), and the
+    /// colours they take from the parent particle.
     spawn_offset: Vec3,
     spawn_velocity: Vec3,
     spawn_colours: Option<[[f32; 4]; 2]>,
@@ -157,6 +162,7 @@ impl<'a> EmitterSim<'a> {
             emitter_velocity: Vec3::ZERO,
             divide_counter: 0,
             children: Vec::new(),
+            parent: None,
             spawn_offset: Vec3::ZERO,
             spawn_velocity: Vec3::ZERO,
             spawn_colours: None,
@@ -227,16 +233,28 @@ impl<'a> EmitterSim<'a> {
         self.finished
     }
 
-    /// The emitter's matrix (emitter+0x340, UpdateEmitterMatrix): the set's matrix times the
-    /// emitter's own.
+    /// The emitter's matrix (emitter+0x340, UpdateEmitterMatrix, Smash 0x8090): the set's
+    /// matrix times the emitter's own. A child emitter's is its parent's matrix times its own,
+    /// or its own alone when its parent's particles keep their birth matrix, since those hand
+    /// it their positions in the world. Sephiroth's Scintilla wall (P_EdgeSenkouShield) is
+    /// seven child rows of hexagons, each row placed by its own translation (9.9 down to -13.8
+    /// in Y); without it all seven rows drew on one line.
     pub fn emitter_srt(&self, set: &Mat4) -> Mat4 {
-        *set * self.local
+        match self.parent {
+            None => *set * self.local,
+            Some((parent, _, false)) => *set * parent * self.local,
+            Some((_, _, true)) => self.local,
+        }
     }
 
-    /// The emitter's matrix without scale (emitter+0x380): the set's, without scale, times
-    /// the emitter's own without scale.
+    /// The emitter's matrix without scale (emitter+0x380), built as [`EmitterSim::emitter_srt`]
+    /// is from the set's matrix without scale.
     pub fn emitter_rt(&self, set_rt: &Mat4) -> Mat4 {
-        *set_rt * self.local_rt
+        match self.parent {
+            None => *set_rt * self.local_rt,
+            Some((_, parent, false)) => *set_rt * parent * self.local_rt,
+            Some((_, _, true)) => self.local_rt,
+        }
     }
 
     /// Spawn `count` particles with the generator at `seed`, as the game's InitializeParticle
@@ -611,10 +629,15 @@ impl<'a> EmitterSim<'a> {
     /// emits from every live parent particle once the particle is res+0x7f8 percent of its
     /// life old, for res+0x7fc frames when it is a one-time emitter and else for the rest of
     /// the particle's life, by its own rate and interval, or by the distance the particle moved
-    /// when it emits by distance (res+0x7f2). A child particle starts at its parent
-    /// particle, in the parent's space (where the parent particle was born, when it does not
-    /// follow the emitter), and takes its velocity (res+0x7d8, times res+0x7e8) and its
-    /// colours and opacities (res+0x7dc..0x7df) as they are at that age.
+    /// when it emits by distance (res+0x7f2). The child's matrix is this emitter's times the
+    /// child's own (Smash 0x8090); a child particle starts at its shape's place plus the parent
+    /// particle's position (Smash 0x9ab0), both in the child's space. When this emitter's
+    /// particles keep their birth matrix (res+0x753 = 1), the parent particle's position and
+    /// velocity are first taken into the world through it, and the child's matrix is its own
+    /// alone. The child takes the parent particle's velocity (res+0x7d8, times res+0x7e8) and
+    /// its colours and opacities (res+0x7dc..0x7df) as they are at that age, and draws at the
+    /// set's scale, as every emitter of the set does (MakeDynamicConstantBuffer, Smash 0x9770,
+    /// reads it from emitter+0x78, the set).
     fn step_children(&mut self) {
         if self.children.is_empty() {
             return;
@@ -624,6 +647,13 @@ impl<'a> EmitterSim<'a> {
         let follows = self.raw.get(0x753).copied().unwrap_or(0) != 1;
         let mut children = std::mem::take(&mut self.children);
         for (index, child) in children.iter_mut().enumerate() {
+            child.parent = Some((self.local, self.local_rt, !follows));
+            child.set_scale = self.set_scale;
+            child.current = if follows {
+                self.current * child.local
+            } else {
+                child.local
+            };
             child.age();
             let raw = child.raw;
             let flag = |at: usize| raw.get(at).copied().unwrap_or(0) != 0;
@@ -668,14 +698,17 @@ impl<'a> EmitterSim<'a> {
                     // A time emission takes its next interval after the particles (Smash 0x30e0).
                     let next_interval = !by_distance;
                     let particle = &self.particles[p];
-                    child.current = if follows {
-                        self.current
+                    let (position, velocity) = if follows {
+                        (particle.position, particle.velocity)
                     } else {
-                        particle.birth_matrix
+                        (
+                            particle.birth_matrix.transform_point3(particle.position),
+                            particle.birth_matrix.transform_vector3(particle.velocity),
+                        )
                     };
-                    child.spawn_offset = particle.position;
+                    child.spawn_offset = position;
                     child.spawn_velocity = if flag(0x7d8) {
-                        particle.velocity * f32_at(raw, 0x7e8)
+                        velocity * f32_at(raw, 0x7e8)
                     } else {
                         Vec3::ZERO
                     };

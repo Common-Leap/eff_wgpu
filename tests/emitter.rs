@@ -1711,3 +1711,190 @@ fn a_world_oriented_velocity_keeps_its_world_direction() {
         assert!(along > 0.9, "{world} does not blow along {designated}");
     }
 }
+
+/// A set's emitter with its children, parsed and with their load-time fixes, run by `f`.
+fn with_children<T>(
+    file: &str,
+    set: &str,
+    name: &str,
+    f: impl FnOnce(&mut sim::EmitterSim) -> T,
+) -> Option<T> {
+    let root = std::env::var_os("VFX_GAME_EFFECTS")?;
+    let data = std::fs::read(std::path::Path::new(&root).join(file)).unwrap();
+    let eff = effect_library::namco_file::NamcoEffectFile::load(&data).unwrap();
+    let p = eff.ptcl_file.as_ref().unwrap();
+    let set = p
+        .emitter_list
+        .emitter_sets
+        .iter()
+        .position(|s| s.name == set)
+        .unwrap();
+    let index = p.emitter_list.emitter_sets[set]
+        .emitters
+        .iter()
+        .position(|e| e.data.name.as_deref() == Some(name))
+        .unwrap();
+    let parsed = &p.emitter_list.emitter_sets[set].emitters[index];
+    let raw = &ptcl::emitter_sets(&p.base_bytes)[set].emitters[index];
+    let fixed = static_block::fixed_emitter_data(raw, &|_| None, None);
+    let children: Vec<Vec<u8>> = raw
+        .children
+        .iter()
+        .map(|c| static_block::fixed_emitter_data(c, &|_| None, None))
+        .collect();
+    let mut s = sim::EmitterSim::new(&parsed.data, &fixed);
+    for (child, fixed) in parsed.children.iter().zip(&children) {
+        s.add_child(&child.data, fixed);
+    }
+    Some(f(&mut s))
+}
+
+/// Sephiroth's Scintilla wall (P_EdgeSenkouShield HexagonFlare01) is seven child emitters, one
+/// row of hexagons each, placed by its own translation: 9.9, 5.9, 1.95, -1.95, -5.9, -9.9 and
+/// -13.8 up the wall. A child's matrix is its parent's times its own (Smash 0x8090). Children
+/// were drawn on their parent's matrix, so all seven rows fell on one line: the tester's
+/// "horizontal row of stacked hexagons" beside Sephiroth's chest. The set is turned and scaled
+/// as edge/SpecialLw spawns it (Y -125, scale 0.85); every row's particles must stand at its
+/// height in the set's space, and draw at the set's scale.
+#[test]
+fn child_emitters_stand_on_their_own_transform() {
+    use glam::{Mat4, Quat, Vec3};
+    let set = Mat4::from_scale_rotation_translation(
+        Vec3::splat(0.85),
+        Quat::from_rotation_y((-125f32).to_radians()),
+        Vec3::new(30.0, 13.0, 9.0),
+    );
+    let Some(rows) = with_children(
+        "fighter/edge/ef_edge.eff",
+        "P_EdgeSenkouShield",
+        "HexagonFlare01",
+        |s| {
+            for _ in 0..8 {
+                s.step_at(&set);
+            }
+            s.children()
+                .iter()
+                .map(|child| {
+                    assert!(child.count() >= 4, "{} hexagons", child.count());
+                    let srt = child.emitter_srt(&set);
+                    let streams = child.streams();
+                    let in_set = |world: Vec3| set.inverse().transform_point3(world).y;
+                    let heights: Vec<f32> = streams["sysLocalPosAttr"]
+                        .iter()
+                        .map(|p| in_set(srt.transform_point3(v3(p))))
+                        .collect();
+                    // Each particle's birth matrix (the shaders' sysEmtMat rows) stands there
+                    // too.
+                    let births: Vec<f32> = (0..child.count())
+                        .map(|i| {
+                            let row = |name: &str| streams[name][i][3];
+                            in_set(Vec3::new(
+                                row("sysEmtMat0Attr"),
+                                row("sysEmtMat1Attr"),
+                                row("sysEmtMat2Attr"),
+                            ))
+                        })
+                        .collect();
+                    let block = child.dynamic_block(&srt, &child.emitter_rt(&set), [1.0; 4]);
+                    let scale = f32::from_le_bytes(block[0x34..0x38].try_into().unwrap());
+                    (heights, births, scale)
+                })
+                .collect::<Vec<_>>()
+        },
+    ) else {
+        eprintln!("VFX_GAME_EFFECTS not set; skipped");
+        return;
+    };
+    let want = [9.9, 5.9, 1.95, -1.95, -5.9, -9.9, -13.8];
+    assert_eq!(rows.len(), want.len());
+    for ((heights, births, scale), want) in rows.iter().zip(want) {
+        for y in heights.iter().chain(births) {
+            assert!(
+                (y - want).abs() < 1e-3,
+                "row at {y}, file puts it at {want}"
+            );
+        }
+        assert!((scale - 0.85).abs() < 1e-5, "particle scale {scale}");
+    }
+}
+
+/// Sephiroth's victory sparks (P_EdgeWinSparks sparks1_b) keep the matrix they were born with
+/// (res+0x753 = 1), so the game hands their child (Emitter2) each spark's position in the
+/// world (Smash 0x8d70) and leaves the child on its own transform alone (Smash 0x8090): moving
+/// or turning the set afterwards does not move the child's emitter, yet its particles start
+/// where the sparks are, at the set, not at the world's origin.
+#[test]
+fn a_child_of_particles_that_keep_their_birth_matrix_lives_in_the_world() {
+    use glam::{Mat4, Quat, Vec3};
+    let at = Vec3::new(500.0, 300.0, -200.0);
+    let set = Mat4::from_rotation_translation(Quat::from_rotation_y(1.0), at);
+    let Some((fixed_matrix, distances)) = with_children(
+        "fighter/edge/ef_edge.eff",
+        "P_EdgeWinSparks",
+        "sparks1_b",
+        |s| {
+            for _ in 0..40 {
+                s.step_at(&set);
+            }
+            let child = &s.children()[1];
+            assert!(child.count() > 0);
+            let elsewhere = Mat4::from_translation(Vec3::new(-40.0, 7.0, 3.0));
+            let fixed_matrix = child.emitter_srt(&set) == child.emitter_srt(&elsewhere);
+            let srt = child.emitter_srt(&set);
+            let distances: Vec<f32> = child.streams()["sysLocalPosAttr"]
+                .iter()
+                .map(|p| (srt.transform_point3(v3(p)) - at).length())
+                .collect();
+            (fixed_matrix, distances)
+        },
+    ) else {
+        eprintln!("VFX_GAME_EFFECTS not set; skipped");
+        return;
+    };
+    assert!(fixed_matrix);
+    for d in distances {
+        assert!(d < 100.0, "a child particle {d} from the set");
+    }
+}
+
+/// Roy's eruption (P_RoyEruption flare2) sits 8 above the set by its own translation, and its
+/// child (smoke3) emits from its particles. The child's matrix is its parent's matrix, set and
+/// parent's own transform both, times its own (Smash 0x8090), and the child's particles keep
+/// that as their birth matrix (smoke3 res+0x753 = 1): the smoke rises from the flare, 8 up,
+/// not from the set's origin.
+#[test]
+fn a_childs_matrix_carries_its_parents_own_transform() {
+    use glam::{Mat4, Quat, Vec3};
+    let set =
+        Mat4::from_rotation_translation(Quat::from_rotation_z(0.5), Vec3::new(-20.0, 4.0, 7.0));
+    let Some((emitter, births)) =
+        with_children("fighter/roy/ef_roy.eff", "P_RoyEruption", "flare2", |s| {
+            for _ in 0..12 {
+                s.step_at(&set);
+            }
+            let child = &s.children()[0];
+            let births: Vec<Vec3> = child.streams()["sysEmtMat0Attr"]
+                .iter()
+                .zip(&child.streams()["sysEmtMat1Attr"])
+                .zip(&child.streams()["sysEmtMat2Attr"])
+                .map(|((a, b), c)| Vec3::new(a[3], b[3], c[3]))
+                .collect();
+            (child.emitter_srt(&set).w_axis.truncate(), births)
+        })
+    else {
+        eprintln!("VFX_GAME_EFFECTS not set; skipped");
+        return;
+    };
+    let flare = set.transform_point3(Vec3::new(0.0, 8.0, 0.0));
+    assert!(
+        (emitter - flare).length() < 1e-4,
+        "{emitter} is not at the flare {flare}"
+    );
+    assert!(!births.is_empty());
+    for at in births {
+        assert!(
+            (at - flare).length() < 1e-4,
+            "smoke born on {at}, the flare is at {flare}"
+        );
+    }
+}
