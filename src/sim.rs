@@ -785,7 +785,8 @@ impl<'a> EmitterSim<'a> {
     /// without scale (emitter+0x5d0) and sits where the particle is: its translation, in this
     /// emitter's space, is the particle's position (emitter+0x5c0), so in the child's own
     /// space that place is turned back through the child's transform. Res+0x7db (colour
-    /// scale) and res+0x7e0 (draw path) are read by no game code.
+    /// scale) and res+0x7e0 (draw path) have no reader in the effect library's code
+    /// (Smash 0x0..0x80000).
     fn inherited(&self, child: &EmitterSim, particle: &Live, age: f32, follows: bool) -> Inherited {
         let raw = child.raw;
         let flag = |at: usize| raw.get(at).copied().unwrap_or(0) != 0;
@@ -1783,6 +1784,160 @@ mod tests {
         let mut s = sim(&part);
         run_until_child(&mut s, 0, 1);
         assert_eq!(row(&s.children[0]), [own[0], own[1], 1.0]);
+    }
+
+    /// What the running game (13.0.4) handed child particles, read at the end of Smash 0x9ab0
+    /// beside the parent particle's streams: Sephiroth's full-charge Gigaflare (Emitter1 from
+    /// sparks4: scale and colours), his charge sparks (one emitter per particle: colours) and
+    /// Roy's full Flare Blade (rotation). All 1,820 records of that session agree; these are
+    /// six of them, at ages where one step either way gives something else.
+    #[test]
+    fn what_a_child_takes_matches_the_running_game() {
+        if skipped() {
+            return;
+        }
+        struct Record {
+            /// Parent age: emitter time less birth, or emitter+0x564 for one per particle.
+            age: f32,
+            step: f32,
+            life: f32,
+            scale: [f32; 3],
+            random: [f32; 4],
+            taken_scale: Option<[f32; 3]>,
+            taken_turn: Option<f32>,
+            colours: Option<[[f32; 4]; 2]>,
+        }
+        let check = |file: &str, set: &str, emitter: usize, child: usize, record: Record| {
+            let part = game_part(file, set, emitter).unwrap();
+            let mut parent = EmitterSim::new(&part.data, &part.fixed);
+            parent.frame_rate = record.step;
+            let of = &part.children[child];
+            let child = EmitterSim::new(&of.data, &of.fixed);
+            let [x, y, z] = record.scale;
+            let particle = Live {
+                position: Vec3::ZERO,
+                velocity: Vec3::ZERO,
+                diff: Vec3::ZERO,
+                life: record.life,
+                birth: 0.0,
+                scale: [x, y, z, 1.0],
+                random: record.random,
+                rotate: [0.0; 4],
+                birth_matrix: Mat4::IDENTITY,
+                colours: [[1.0; 4]; 2],
+                child_emission: Vec::new(),
+                id: 0,
+                anchor: None,
+            };
+            let got = parent.inherited(&child, &particle, record.age, true);
+            let near = |a: f32, b: f32| (a - b).abs() < 1e-4;
+            assert_eq!(got.scale.is_some(), record.taken_scale.is_some());
+            if let (Some(got), Some(want)) = (got.scale, record.taken_scale) {
+                assert!((0..3).all(|k| near(got[k], want[k])), "{got} {want:?}");
+            }
+            assert_eq!(got.rotate.is_some(), record.taken_turn.is_some());
+            if let (Some(got), Some(want)) = (got.rotate, record.taken_turn) {
+                assert!(near(got.z, want) && got.x == 0.0 && got.y == 0.0, "{got}");
+            }
+            if let Some(want) = record.colours {
+                for k in 0..2 {
+                    for c in 0..4 {
+                        let got = got.colours[k][c].unwrap();
+                        assert!(near(got, want[k][c]), "colour {k} {c}: {got} {want:?}");
+                    }
+                }
+            }
+        };
+        let gigaflare = |age, life, scale, random, taken_scale, colours| {
+            let record = Record {
+                age,
+                step: 1.0,
+                life,
+                scale,
+                random,
+                taken_scale: Some(taken_scale),
+                taken_turn: None,
+                colours: Some(colours),
+            };
+            check(
+                "fighter/edge/ef_edge.eff",
+                "EDGE_FIRE3_BURST2",
+                9,
+                0,
+                record,
+            );
+        };
+        gigaflare(
+            2.0,
+            17.400002,
+            [6.3827963, 12.7890625, 11.152418],
+            [0.5392321, 0.7159593, 0.9102671, 0.74755865],
+            [6.1923285, 12.407426, 10.819621],
+            [[2.0, 2.0, 2.0, 1.0], [2.0, 0.0, 0.08673049, 1.0]],
+        );
+        gigaflare(
+            9.0,
+            24.0,
+            [7.236662, 12.477024, 14.6442995],
+            [0.9251717, 0.78743845, 0.11956772, 0.84290457],
+            [5.984163, 10.317539, 12.109709],
+            [
+                [2.0, 1.9927348, 1.9982266, 1.0],
+                [2.0, 0.0, 0.049493782, 1.0],
+            ],
+        );
+        gigaflare(
+            21.0,
+            27.0,
+            [6.6923494, 12.730158, 13.341118],
+            [0.34320498, 0.7480073, 0.111577585, 0.2764631],
+            [3.069599, 5.838978, 6.1192083],
+            [[2.0, 1.1047585, 1.781477, 1.0], [2.0, 0.0, 0.0, 1.0]],
+        );
+        let charge = |age, life, size: f32, random, colours| {
+            let record = Record {
+                age,
+                step: 1.0,
+                life,
+                scale: [size; 3],
+                random,
+                taken_scale: None,
+                taken_turn: None,
+                colours: Some(colours),
+            };
+            check("fighter/edge/ef_edge.eff", "EDGE_FIRE1_HOLD", 7, 0, record);
+        };
+        charge(
+            3.0,
+            21.84,
+            3.6898875,
+            [0.36322674, 0.4026642, 0.9192214, 0.29741958],
+            [
+                [5.0, 1.1765441, 1.1315339, 2.0],
+                [5.0, 0.19841285, 0.19841285, 0.9299687],
+            ],
+        );
+        charge(
+            17.0,
+            20.4,
+            3.2105603,
+            [0.4671461, 0.91357005, 0.34266183, 0.40876815],
+            [
+                [5.0, 4.4665318, 3.777467, 2.0],
+                [5.0, 0.19841285, 0.19841285, 0.1190476],
+            ],
+        );
+        let record = Record {
+            age: 0.0,
+            step: 0.7,
+            life: 45.6,
+            scale: [0.9337501; 3],
+            random: [0.37254477, 0.92193, 0.0077153067, 0.57483727],
+            taken_scale: None,
+            taken_turn: Some(0.048476703),
+            colours: None,
+        };
+        check("fighter/roy/ef_roy.eff", "ROY_ERUPTION_MAX", 4, 0, record);
     }
 
     /// Yoshi's Final Smash stars (star1) each carry their own starline1 emitter (res+0x7e4):
