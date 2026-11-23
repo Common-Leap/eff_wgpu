@@ -986,12 +986,12 @@ impl MaxLen for Vec<u8> {
     }
 }
 
-/// Smash's sysCustomShaderUniformBlock2 (0x60 bytes) as read from the game's GPU memory in a
-/// capture of a training-stage frame (13.0.4, Ryujinx + RenderDoc): every effect draw in the
+/// Smash's sysCustomShaderUniformBlock2 (0x60 bytes). Rows 0-4 are as read from the game's GPU
+/// memory in a capture of a training-stage frame (13.0.4, Ryujinx + RenderDoc): every effect draw in the
 /// frame bound this one block. Row 0 x is a global colour scale: the game writes 0.5 and draws
 /// into a buffer its post pass scales back up (x1.3703 in gamma space, x2 linear). Use
 /// [game_custom2] when drawing into a scene that gets that post pass; this block's 1.0 is the
-/// equivalent for a target shown as is. Rows 1-4 are the captured values.
+/// equivalent for a target shown as is.
 ///
 /// Row 5 is past what the capture read. 13.0.4 builds the block at main+0x355a808 (0x60 bytes
 /// from a global; v0 built 0x50) and fills row 5 at main+0x374de74 with (1, 0, 0, 0) from
