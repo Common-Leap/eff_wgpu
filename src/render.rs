@@ -119,7 +119,7 @@ pub struct EmitterDraw<'a> {
     /// sysCustomShaderUniformBlock0 as the game fills it for this draw, where it does: Inkling's
     /// ink shaders read her ink colour from it (row 0 multiplies the colour, row 1 is added).
     pub user_block: Option<&'a [u8]>,
-    /// sysCustomShaderUniformBlock2: the game's per-draw block (0x50 bytes).
+    /// sysCustomShaderUniformBlock2: the game's per-draw block (0x60 bytes).
     pub custom2_block: Option<&'a [u8]>,
     /// Per-particle streams by attribute name (`sysLocalPosAttr`, ...), one vec4 per particle.
     pub streams: &'a HashMap<&'static str, Vec<[f32; 4]>>,
@@ -171,14 +171,17 @@ impl GpuTexture {
 }
 
 /// The texture layout for a program: 2D or 2D-array per slot, as its stages declare.
+/// The depth copy is one 32-bit float a pixel, which is not filterable everywhere: its slot
+/// takes it unfiltered, through a sampler that does not filter.
 fn texture_layout(device: &wgpu::Device, arrays: &[bool; SLOTS as usize]) -> wgpu::BindGroupLayout {
     let mut entries = Vec::new();
     for s in 0..SLOTS {
+        let filterable = s as usize != SLOT_DEPTH;
         entries.push(wgpu::BindGroupLayoutEntry {
             binding: s * 2,
             visibility: wgpu::ShaderStages::VERTEX_FRAGMENT | wgpu::ShaderStages::COMPUTE,
             ty: wgpu::BindingType::Texture {
-                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                sample_type: wgpu::TextureSampleType::Float { filterable },
                 view_dimension: if arrays[s as usize] {
                     wgpu::TextureViewDimension::D2Array
                 } else {
@@ -191,7 +194,11 @@ fn texture_layout(device: &wgpu::Device, arrays: &[bool; SLOTS as usize]) -> wgp
         entries.push(wgpu::BindGroupLayoutEntry {
             binding: s * 2 + 1,
             visibility: wgpu::ShaderStages::VERTEX_FRAGMENT | wgpu::ShaderStages::COMPUTE,
-            ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+            ty: wgpu::BindingType::Sampler(if filterable {
+                wgpu::SamplerBindingType::Filtering
+            } else {
+                wgpu::SamplerBindingType::NonFiltering
+            }),
             count: None,
         });
     }
@@ -219,13 +226,16 @@ pub struct EffectRenderer {
     zero_bank: wgpu::Buffer,
     view_bank: wgpu::Buffer,
     blank: GpuTexture,
+    /// Nearest, clamped: also what the depth copy is read through.
     blank_sampler: wgpu::Sampler,
+    /// Linear, clamped: the frame copy, which refraction reads between pixels.
+    frame_sampler: wgpu::Sampler,
     /// What the pixel shaders read as the frame drawn so far (sysFrameBufferTexture, slot 3)
-    /// and its depth (sysDepthBufferTexture, slot 4). Without a scene copy the frame is the
-    /// background colour and the depth is 1.0, "nothing behind": soft particles draw in full.
+    /// and its depth (sysDepthBufferTexture, slot 4), see `scene::SceneCopy`. Without a scene
+    /// copy the frame is the background colour and the depth is 1.0, "nothing behind": soft
+    /// particles draw in full and floor decals not at all.
     background: wgpu::Texture,
-    scene_color: Option<wgpu::TextureView>,
-    scene_depth: Option<wgpu::TextureView>,
+    scene: Mutex<(Option<wgpu::TextureView>, Option<wgpu::TextureView>)>,
 }
 
 /// Banks every pipeline layout declares (a program that does not read one simply ignores it).
@@ -318,9 +328,13 @@ impl EffectRenderer {
             view_bank: buffer("vfx view bank", BANK_BYTES),
             blank,
             blank_sampler: device.create_sampler(&wgpu::SamplerDescriptor::default()),
+            frame_sampler: device.create_sampler(&wgpu::SamplerDescriptor {
+                mag_filter: wgpu::FilterMode::Linear,
+                min_filter: wgpu::FilterMode::Linear,
+                ..Default::default()
+            }),
             background,
-            scene_color: None,
-            scene_depth: None,
+            scene: Mutex::default(),
             failures: Mutex::default(),
         }
     }
@@ -367,15 +381,11 @@ impl EffectRenderer {
         );
     }
 
-    /// A copy of the frame drawn so far and its depth (as 0..1 in a float texture), for
-    /// refraction and soft-particle shaders. `None` falls back to the background and to 1.0.
-    pub fn set_scene(
-        &mut self,
-        color: Option<wgpu::TextureView>,
-        depth: Option<wgpu::TextureView>,
-    ) {
-        self.scene_color = color;
-        self.scene_depth = depth;
+    /// A copy of the frame drawn so far and its depth (as 0..1 in an unfiltered float texture,
+    /// see `scene::SceneCopy`), for refraction, soft-particle and floor-decal shaders. `None`
+    /// falls back to the background and to 1.0. Draws prepared from then on read these.
+    pub fn set_scene(&self, color: Option<wgpu::TextureView>, depth: Option<wgpu::TextureView>) {
+        *lock(&self.scene) = (color, depth);
     }
 
     /// The camera block (see `view_block`), shared by every emitter this frame.
@@ -833,18 +843,22 @@ impl EffectRenderer {
         });
         let mut entries = Vec::new();
         let background = self.background.create_view(&Default::default());
+        let scene = lock(&self.scene).clone();
         for s in 0..SLOTS as usize {
             let view = match s {
-                SLOT_FRAME => self.scene_color.as_ref().unwrap_or(&background),
-                SLOT_DEPTH => self.scene_depth.as_ref().unwrap_or(&self.blank.flat),
+                SLOT_FRAME => scene.0.as_ref().unwrap_or(&background),
+                SLOT_DEPTH => scene.1.as_ref().unwrap_or(&self.blank.flat),
                 _ => draw.textures[s].unwrap_or(&self.blank).view(c.arrays[s]),
             };
-            let sampler = draw
-                .samplers
-                .get(s)
-                .copied()
-                .flatten()
-                .unwrap_or(&self.blank_sampler);
+            let sampler = match s {
+                SLOT_FRAME => &self.frame_sampler,
+                _ => draw
+                    .samplers
+                    .get(s)
+                    .copied()
+                    .flatten()
+                    .unwrap_or(&self.blank_sampler),
+            };
             entries.push(wgpu::BindGroupEntry {
                 binding: s as u32 * 2,
                 resource: wgpu::BindingResource::TextureView(view),
@@ -972,12 +986,19 @@ impl MaxLen for Vec<u8> {
     }
 }
 
-/// Smash's sysCustomShaderUniformBlock2 (0x50 bytes) as read from the game's GPU memory in a
+/// Smash's sysCustomShaderUniformBlock2 (0x60 bytes) as read from the game's GPU memory in a
 /// capture of a training-stage frame (13.0.4, Ryujinx + RenderDoc): every effect draw in the
 /// frame bound this one block. Row 0 x is a global colour scale: the game writes 0.5 and draws
 /// into a buffer its post pass scales back up (x1.3703 in gamma space, x2 linear). Use
 /// [game_custom2] when drawing into a scene that gets that post pass; this block's 1.0 is the
 /// equivalent for a target shown as is. Rows 1-4 are the captured values.
+///
+/// Row 5 is past what the capture read. 13.0.4 builds the block at main+0x355a808 (0x60 bytes
+/// from a global; v0 built 0x50) and fills row 5 at main+0x374de74 with (1, 0, 0, 0) from
+/// rodata 0x4467ca0 while a byte flag is clear, else a half-width (0.5, 0.5, 0, 0). Every
+/// shader that reads the frame or depth copy maps its screen x through row 5 (x times row 5 x,
+/// plus row 5 y times view row 17 w): left at zero, each of them read the copy's first column
+/// instead of the pixel behind it.
 pub fn default_custom2() -> Vec<u8> {
     custom2_with_scale(1.0)
 }
@@ -988,12 +1009,13 @@ pub fn game_custom2() -> Vec<u8> {
 }
 
 fn custom2_with_scale(scale: f32) -> Vec<u8> {
-    let rows: [f32; 20] = [
+    let rows: [f32; 24] = [
         scale, 0.0, 0.0, 0.0, //
         1.0, 1.0, 1.0, 1.0, //
         1.0, 0.0, 1.0, -1.0, //
         0.0, 0.0, 0.0, 0.0, //
-        1.0, -99999.0, 1.0, 0.0,
+        1.0, -99999.0, 1.0, 0.0, //
+        1.0, 0.0, 0.0, 0.0,
     ];
     rows.iter().flat_map(|v| v.to_le_bytes()).collect()
 }

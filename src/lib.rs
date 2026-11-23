@@ -9,6 +9,7 @@ pub mod mesh;
 pub mod ptcl;
 pub mod random;
 pub mod render;
+pub mod scene;
 pub mod sim;
 pub mod static_block;
 pub mod texture;
