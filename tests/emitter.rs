@@ -1495,7 +1495,12 @@ fn a_child_takes_its_parents_random_colour_key() {
     assert!(colours.len() >= 10, "{}", colours.len());
     let emitter =
         |k: usize| f32::from_le_bytes(fixed[0x7ac + 4 * k..0x7b0 + 4 * k].try_into().unwrap());
-    let near = |a: [f32; 3], b: [f32; 3]| (0..3).all(|k| (a[k] - b[k] * emitter(k)).abs() < 1e-4);
+    // The game hands the key times the star's colour scale (res+0x3b0, 1.6 here; Smash 0x1066c
+    // in CalculateParticleColor0VecFromTime) and its emitter colour.
+    let scale = f32::from_le_bytes(fixed[0x3b0..0x3b4].try_into().unwrap());
+    assert_eq!(scale, 1.6);
+    let near =
+        |a: [f32; 3], b: [f32; 3]| (0..3).all(|k| (a[k] - b[k] * emitter(k) * scale).abs() < 1e-4);
     for c in &colours {
         assert!(
             keys.iter().any(|k| near(*c, *k)),

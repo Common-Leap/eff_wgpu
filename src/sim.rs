@@ -32,6 +32,29 @@ struct Live {
     /// Each child emitter's emission from this particle: timer, interval and the amount not
     /// yet emitted.
     child_emission: Vec<[f32; 3]>,
+    /// Which of its emitter's particles this is, for the children that follow it.
+    id: u64,
+    /// For a particle of a child emitted once per parent particle (res+0x7e4): the parent
+    /// particle it rides with and where that particle was last frame.
+    anchor: Option<(u64, Vec3)>,
+}
+
+/// What a child particle takes from its parent particle (Smash 0x9ab0, run after
+/// InitializeParticle for each particle a child emitter emits).
+#[derive(Debug, Clone, Copy, Default)]
+struct Inherited {
+    /// The parent particle's position: added to the particle's own.
+    offset: Vec3,
+    /// The parent particle's velocity times res+0x7e8, when res+0x7d8 asks for it.
+    velocity: Vec3,
+    /// The parent particle's scale at its age times res+0x7ec (res+0x7d9): replaces the
+    /// particle's own base scale; its own scale curve still runs on top in the shader.
+    scale: Option<Vec3>,
+    /// The parent particle's rotation at its age (res+0x7da): replaces the initial rotation.
+    rotate: Option<Vec3>,
+    /// Colour 0 and 1: the parent's colour (res+0x7dc, 0x7dd) and opacity (res+0x7de, 0x7df).
+    colours: [[Option<f32>; 4]; 2],
+    anchor: Option<(u64, Vec3)>,
 }
 
 fn i32_at(b: &[u8], at: usize) -> i32 {
@@ -104,12 +127,15 @@ pub struct EmitterSim<'a> {
     /// whether the parent's particles keep their birth matrix (parent res+0x753 = 1), which
     /// leaves the child in the world on its own transform alone (Smash 0x8090).
     parent: Option<(Mat4, Mat4, bool)>,
-    /// Where a child's next particles start (its parent particle's position, in the child's
-    /// space, or in the world when the parent's particles keep their birth matrix), and the
-    /// colours they take from the parent particle.
-    spawn_offset: Vec3,
-    spawn_velocity: Vec3,
-    spawn_colours: Option<[[f32; 4]; 2]>,
+    /// What a child's next particles take from the parent particle they are emitted from.
+    inherit: Option<Inherited>,
+    /// For a child emitter: its parent's emitter opacities (res+0x7b8, 0x7c8) and fade this
+    /// frame, which its own multiply by when it takes the parent's opacity every frame
+    /// (res+0x7e2, 0x7e3; MakeDynamicConstantBuffer, Smash 0x9770).
+    parent_alpha: [f32; 2],
+    parent_fade: f32,
+    /// The id the next particle takes.
+    next_id: u64,
     /// Set when the effect is killed (`EFFECT_OFF_KIND`; the game's fade request).
     killed: bool,
     fields: Fields,
@@ -163,9 +189,10 @@ impl<'a> EmitterSim<'a> {
             divide_counter: 0,
             children: Vec::new(),
             parent: None,
-            spawn_offset: Vec3::ZERO,
-            spawn_velocity: Vec3::ZERO,
-            spawn_colours: None,
+            inherit: None,
+            parent_alpha: [1.0; 2],
+            parent_fade: 1.0,
+            next_id: 0,
             killed: false,
             fields: Fields::default(),
             fade_out: 1.0,
@@ -308,6 +335,7 @@ impl<'a> EmitterSim<'a> {
         let velocity = &data.particle_velocity;
         let vec3_at =
             |at: usize| Vec3::new(f32_at(raw, at), f32_at(raw, at + 4), f32_at(raw, at + 8));
+        let inherit = self.inherit.unwrap_or_default();
         for index in 0..count {
             // InitializeParticle (Smash 0xa2d0), its draws in the game's order. The shape's
             // place and outward direction, the direction at the all-direction speed.
@@ -337,7 +365,7 @@ impl<'a> EmitterSim<'a> {
             if scatter != 0.0 {
                 position += self.rng.unit() * scatter;
             }
-            position += self.spawn_offset;
+            position += inherit.offset;
             // The designated direction (res+0x96c), spread by the diffusion angle (res+0x978,
             // degrees) over a cap about it: two draws, the turn about it and the height on the
             // cap, which runs linearly from 1 - angle / 90 to 1 (a whole sphere at 180).
@@ -366,7 +394,7 @@ impl<'a> EmitterSim<'a> {
             // dots that drift in after them (0.2), so each trail stretches as it goes.
             vel += self.rng.cube() * vec3_at(0x980);
             vel += self.emitter_velocity * f32_at(raw, 0x990);
-            vel += self.spawn_velocity;
+            vel += inherit.velocity;
             // Scale: base (0x9c0..) * (1 - random% / 100 * r); one draw for every axis when the
             // x and y percentages match.
             let (px, py, pz) = (f32_at(raw, 0x9cc), f32_at(raw, 0x9d0), f32_at(raw, 0x9d4));
@@ -382,12 +410,15 @@ impl<'a> EmitterSim<'a> {
             };
             let spread = f32_at(raw, 0x8c0);
             let w = 1.0 + spread * (1.0 - 2.0 * self.rng.next());
-            let scale4 = [
+            let mut scale4 = [
                 f32_at(raw, 0x9c0) * factors[0],
                 f32_at(raw, 0x9c4) * factors[1],
                 f32_at(raw, 0x9c8) * factors[2],
                 w,
             ];
+            if let Some(s) = inherit.scale {
+                scale4[..3].copy_from_slice(&s.to_array());
+            }
             // Life: life * (1 - randint(0..life_random) / 100), or 2^28 frames when infinite.
             let life = if raw.get(0x8a8).copied().unwrap_or(0) != 0 {
                 268_435_456.0
@@ -406,12 +437,25 @@ impl<'a> EmitterSim<'a> {
             // times the particle's random values. These offsets were 0x320.., the second
             // sampler's texture scale (1, 1), which turned every mesh particle 57 degrees about
             // X and Y: Sephiroth's charge ball was seen side on.
-            let rotate = [
+            let mut rotate = [
                 f32_at(raw, 0x700),
                 f32_at(raw, 0x704),
                 f32_at(raw, 0x708),
                 0.0,
             ];
+            if let Some(r) = inherit.rotate {
+                rotate[..3].copy_from_slice(&r.to_array());
+            }
+            let mut colours = [self.particle_colour; 2];
+            for (colour, taken) in colours.iter_mut().zip(inherit.colours) {
+                for (channel, value) in colour.iter_mut().zip(taken) {
+                    if let Some(value) = value {
+                        *channel = value;
+                    }
+                }
+            }
+            let id = self.next_id;
+            self.next_id += 1;
             self.particles.push(Live {
                 position,
                 velocity: vel,
@@ -422,10 +466,10 @@ impl<'a> EmitterSim<'a> {
                 random,
                 rotate,
                 birth_matrix: self.current,
-                colours: self
-                    .spawn_colours
-                    .unwrap_or([self.particle_colour, self.particle_colour]),
+                colours,
                 child_emission: vec![[0.0; 3]; self.children.len()],
+                id,
+                anchor: inherit.anchor,
             });
         }
     }
@@ -634,10 +678,14 @@ impl<'a> EmitterSim<'a> {
     /// particle's position (Smash 0x9ab0), both in the child's space. When this emitter's
     /// particles keep their birth matrix (res+0x753 = 1), the parent particle's position and
     /// velocity are first taken into the world through it, and the child's matrix is its own
-    /// alone. The child takes the parent particle's velocity (res+0x7d8, times res+0x7e8) and
-    /// its colours and opacities (res+0x7dc..0x7df) as they are at that age, and draws at the
-    /// set's scale, as every emitter of the set does (MakeDynamicConstantBuffer, Smash 0x9770,
-    /// reads it from emitter+0x78, the set).
+    /// alone. What else a child particle takes from its parent particle is in
+    /// [`EmitterSim::inherited`]. The child draws at the set's scale, as every emitter of the
+    /// set does (MakeDynamicConstantBuffer, Smash 0x9770, reads it from emitter+0x78, the set).
+    ///
+    /// A child that is one emitter per parent particle (res+0x7e4; the game makes it when the
+    /// particle is born, Smash 0xa2d0) is placed at that particle every frame (Smash 0x8d70's
+    /// second loop writes emitter+0x5c0, and 0x8090 adds it to the emitter's translation), so
+    /// its particles that follow their emitter ride with the parent particle.
     fn step_children(&mut self) {
         if self.children.is_empty() {
             return;
@@ -645,10 +693,15 @@ impl<'a> EmitterSim<'a> {
         let step = self.frame_rate;
         let now = self.time - step;
         let follows = self.raw.get(0x753).copied().unwrap_or(0) != 1;
+        let parent_alpha = [f32_at(self.raw, 0x7b8), f32_at(self.raw, 0x7c8)];
+        let parent_fade = self.fade(0x75b, 0x755);
         let mut children = std::mem::take(&mut self.children);
+        let mut anchors: Option<HashMap<u64, Vec3>> = None;
         for (index, child) in children.iter_mut().enumerate() {
             child.parent = Some((self.local, self.local_rt, !follows));
             child.set_scale = self.set_scale;
+            child.parent_alpha = parent_alpha;
+            child.parent_fade = parent_fade;
             child.current = if follows {
                 self.current * child.local
             } else {
@@ -657,6 +710,16 @@ impl<'a> EmitterSim<'a> {
             child.age();
             let raw = child.raw;
             let flag = |at: usize| raw.get(at).copied().unwrap_or(0) != 0;
+            let per_particle = flag(0x7e4);
+            if per_particle && raw.get(0x753).copied().unwrap_or(0) != 1 {
+                let anchors = anchors.get_or_insert_with(|| {
+                    self.particles
+                        .iter()
+                        .map(|p| (p.id, anchor_of(p, follows)))
+                        .collect()
+                });
+                child.follow(anchors);
+            }
             let timing = u32_at(raw, 0x7f8) as f32 / 100.0;
             let one_time = flag(0x7f0);
             let duration = u32_at(raw, 0x7fc) as f32;
@@ -697,36 +760,9 @@ impl<'a> EmitterSim<'a> {
                 if n > 0 {
                     // A time emission takes its next interval after the particles (Smash 0x30e0).
                     let next_interval = !by_distance;
-                    let particle = &self.particles[p];
-                    let (position, velocity) = if follows {
-                        (particle.position, particle.velocity)
-                    } else {
-                        (
-                            particle.birth_matrix.transform_point3(particle.position),
-                            particle.birth_matrix.transform_vector3(particle.velocity),
-                        )
-                    };
-                    child.spawn_offset = position;
-                    child.spawn_velocity = if flag(0x7d8) {
-                        velocity * f32_at(raw, 0x7e8)
-                    } else {
-                        Vec3::ZERO
-                    };
-                    let mut colours = [child.particle_colour; 2];
-                    for (k, (rgb, alpha)) in [(0x7dc, 0x7de), (0x7dd, 0x7df)].iter().enumerate() {
-                        let parent = self.colour_at(k, particle, age);
-                        if flag(*rgb) {
-                            colours[k][..3].copy_from_slice(&parent[..3]);
-                        }
-                        if flag(*alpha) {
-                            colours[k][3] = parent[3];
-                        }
-                    }
-                    child.spawn_colours = Some(colours);
+                    child.inherit = Some(self.inherited(child, &self.particles[p], age, follows));
                     child.spawn(n);
-                    child.spawn_offset = Vec3::ZERO;
-                    child.spawn_velocity = Vec3::ZERO;
-                    child.spawn_colours = None;
+                    child.inherit = None;
                     if next_interval {
                         state[1] = child.next_interval();
                         child.update_matrix_by_emit();
@@ -739,79 +775,225 @@ impl<'a> EmitterSim<'a> {
         self.children = children;
     }
 
-    /// A particle's colour `which` (0 or 1) and its opacity at `age` (Smash's
-    /// CalculateParticleColor0/1VecFromTime): constant, a key picked by the particle's random
-    /// value, or the 8-key curve over its life; times the emitter's colour (res+0x7ac / 0x7bc).
-    fn colour_at(&self, which: usize, particle: &Live, age: f32) -> [f32; 4] {
-        use effect_library::enums::ColorType;
-        let c = &self.data.particle_color;
-        let s = &self.data.emitter_static;
-        let (kind, alpha_kind, constant, keys, alpha_keys, count, alpha_count, emitter) =
-            if which == 0 {
-                (
-                    &c.color0_type,
-                    &c.alpha0_type,
-                    [c.color0_r, c.color0_g, c.color0_b, c.alpha0],
-                    &s.color0,
-                    &s.alpha0,
-                    s.num_color0_keys,
-                    s.num_alpha0_keys,
-                    0x7ac,
-                )
+    /// What `child`'s particles emitted now from `particle` (this emitter's, `age` frames old)
+    /// take from it (Smash 0x9ab0). Its position and, when res+0x7d8 asks, its velocity times
+    /// res+0x7e8; its scale at its age (res+0x7d9) times res+0x7ec; its rotation at its age
+    /// (res+0x7da); its colour and opacity 0 and 1 at its age (res+0x7dc..0x7df). The game
+    /// reads that age one frame step back for a child shared by every particle, and as it is
+    /// for a child that is one emitter per particle (emitter+0x564, written by Smash 0x8d70).
+    /// A child per particle takes the particle's velocity turned by this emitter's matrix
+    /// without scale (emitter+0x5d0) and sits where the particle is: its translation, in this
+    /// emitter's space, is the particle's position (emitter+0x5c0), so in the child's own
+    /// space that place is turned back through the child's transform. Res+0x7db (colour
+    /// scale) and res+0x7e0 (draw path) are read by no game code.
+    fn inherited(&self, child: &EmitterSim, particle: &Live, age: f32, follows: bool) -> Inherited {
+        let raw = child.raw;
+        let flag = |at: usize| raw.get(at).copied().unwrap_or(0) != 0;
+        let per_particle = flag(0x7e4);
+        let at = if per_particle {
+            age
+        } else {
+            age - self.frame_rate
+        };
+        let (position, velocity) = if follows {
+            (particle.position, particle.velocity)
+        } else {
+            (
+                particle.birth_matrix.transform_point3(particle.position),
+                particle.birth_matrix.transform_vector3(particle.velocity),
+            )
+        };
+        let (offset, velocity) = if per_particle {
+            let own = child.local;
+            let offset = if own.determinant().abs() > 1e-12 {
+                own.inverse().transform_vector3(position)
             } else {
-                (
-                    &c.color1_type,
-                    &c.alpha1_type,
-                    [c.color1_r, c.color1_g, c.color1_b, c.alpha1],
-                    &s.color1,
-                    &s.alpha1,
-                    s.num_color1_keys,
-                    s.num_alpha1_keys,
-                    0x7bc,
-                )
+                position
             };
-        let t = age / particle.life.max(1.0);
-        let pick = |kind: &ColorType,
-                    table: &effect_library::emitter::AnimationKeyTable,
-                    count: u32|
-         -> Option<[f32; 3]> {
-            let keys = &table.keys[..(count as usize).min(8)];
-            let at = |k: &effect_library::emitter::AnimationKey| [k.x, k.y, k.z];
-            match kind {
-                ColorType::Animated8Key if !keys.is_empty() => {
-                    if keys.len() == 1 || t <= keys[0].time {
-                        return Some(at(&keys[0]));
+            (offset, unscaled(&self.current) * particle.velocity)
+        } else {
+            (position, velocity)
+        };
+        let mut colours = [[None; 4]; 2];
+        for (k, (rgb, alpha)) in [(0x7dc, 0x7de), (0x7dd, 0x7df)].into_iter().enumerate() {
+            if flag(rgb) || flag(alpha) {
+                let parent = self.colour_at(k, particle, at);
+                if flag(rgb) {
+                    for c in 0..3 {
+                        colours[k][c] = Some(parent[c]);
                     }
-                    let last = keys[keys.len() - 1];
-                    if t >= last.time {
-                        return Some(at(&last));
-                    }
-                    let i = keys.windows(2).position(|w| t < w[1].time).unwrap_or(0);
-                    let (a, b) = (keys[i], keys[i + 1]);
-                    let f = (t - a.time) / (b.time - a.time).max(1e-6);
-                    Some([
-                        a.x + (b.x - a.x) * f,
-                        a.y + (b.y - a.y) * f,
-                        a.z + (b.z - a.z) * f,
-                    ])
                 }
-                // Type 3 picks a key by the particle's first random value. effect_library calls
-                // type 1 Random, which no game file uses; 3 reads as Unknown(3).
-                ColorType::Unknown(3) | ColorType::Random if !keys.is_empty() => {
-                    let i = ((particle.random[0] * keys.len() as f32) as usize).min(keys.len() - 1);
-                    Some(at(&keys[i]))
+                if flag(alpha) {
+                    colours[k][3] = Some(parent[3]);
                 }
-                _ => None,
+            }
+        }
+        Inherited {
+            offset,
+            velocity: if flag(0x7d8) {
+                velocity * f32_at(raw, 0x7e8)
+            } else {
+                Vec3::ZERO
+            },
+            scale: flag(0x7d9).then(|| self.scale_at(particle, at) * f32_at(raw, 0x7ec)),
+            rotate: flag(0x7da).then(|| self.rotation_at(particle, at)),
+            colours,
+            anchor: per_particle.then_some((particle.id, position)),
+        }
+    }
+
+    /// Move the particles of a child that is one emitter per parent particle by how far their
+    /// parent particle moved since last frame (`anchors`: each live parent particle's place),
+    /// in the child's own space. A particle whose parent particle is gone stays where it is:
+    /// the game stops placing that emitter (Smash 0x8d70 only places emitters whose particle
+    /// is alive).
+    fn follow(&mut self, anchors: &HashMap<u64, Vec3>) {
+        let own = self.local;
+        let to_own = |v: Vec3| {
+            if own.determinant().abs() > 1e-12 {
+                own.inverse().transform_vector3(v)
+            } else {
+                v
             }
         };
-        let rgb = pick(kind, keys, count).unwrap_or([constant[0], constant[1], constant[2]]);
-        let alpha = pick(alpha_kind, alpha_keys, alpha_count).map_or(constant[3], |a| a[0]);
-        [
-            rgb[0] * f32_at(self.raw, emitter),
-            rgb[1] * f32_at(self.raw, emitter + 4),
-            rgb[2] * f32_at(self.raw, emitter + 8),
-            alpha * f32_at(self.raw, emitter + 12),
-        ]
+        for particle in &mut self.particles {
+            let Some((id, last)) = particle.anchor.as_mut() else {
+                continue;
+            };
+            if let Some(&now) = anchors.get(id) {
+                particle.position += to_own(now - *last);
+                *last = now;
+            }
+        }
+    }
+
+    /// The fade-in where `fade_in` (res+0x75b or 0x75c) asks for it times the fade-out after a
+    /// kill where `fade_out` (res+0x755 or 0x756) does (MakeDynamicConstantBuffer).
+    fn fade(&self, fade_in: usize, fade_out: usize) -> f32 {
+        let on = |flag: usize| self.raw.get(flag).copied().unwrap_or(0) != 0;
+        (if on(fade_in) { self.fade_in } else { 1.0 })
+            * (if on(fade_out) { self.fade_out } else { 1.0 })
+    }
+
+    /// A particle's scale at `age` (CalculateParticleScaleVecFromTime, Smash 0xffe0): its
+    /// scale stream times the scale curve (res+0x600, res+0x70 keys; the first key alone under
+    /// two), then, when res+0x9e5 asks, a wave on X and Y (see [`wave`]).
+    fn scale_at(&self, particle: &Live, age: f32) -> Vec3 {
+        let raw = self.raw;
+        let flag = |at: usize| raw.get(at).copied().unwrap_or(0) != 0;
+        let count = i32_at(raw, 0x70);
+        let curve = if count < 2 {
+            key(raw, 0x600, 0).0
+        } else {
+            let rate = if flag(0x8dc) {
+                i32_at(raw, 0x8f4) as f32
+            } else {
+                0.0
+            };
+            let random_loop = raw.get(0x8e1).copied().unwrap_or(0) as f32;
+            let k = Keys {
+                table: 0x600,
+                count,
+                loop_rate: rate,
+                random_loop,
+            };
+            k.at(raw, particle.random[0], age, particle.life)
+        };
+        let mut scale = Vec3::from_slice(&particle.scale[..3]) * curve;
+        if flag(0x9e5) {
+            let x = wave(raw, particle.random[0], age, 0);
+            let y = if flag(0x9e6) {
+                wave(raw, particle.random[0], age, 1)
+            } else {
+                x
+            };
+            scale.x *= x;
+            scale.y *= y;
+        }
+        scale
+    }
+
+    /// A particle's rotation at `age` (CalculateRotationMatrix, Smash 0x114f0): its initial
+    /// rotation plus the random range (res+0x710) times its random values, turning at the
+    /// rotation speed (res+0x720) plus its random share (res+0x730) slowed by the rotation's
+    /// air resistance (res+0x72c). Each axis turns the other way, initial angle included,
+    /// when its flag (res+0x8ad..0x8af) is set and the particle's next random value is at
+    /// least a half.
+    fn rotation_at(&self, particle: &Live, age: f32) -> Vec3 {
+        let raw = self.raw;
+        let v3 = |at: usize| Vec3::new(f32_at(raw, at), f32_at(raw, at + 4), f32_at(raw, at + 8));
+        let (range, speed, speed_random) = (v3(0x710), v3(0x720), v3(0x730));
+        let r = particle.random;
+        let mut out = Vec3::ZERO;
+        for axis in 0..3 {
+            let next = r[(axis + 1) % 3];
+            let flip = raw.get(0x8ad + axis).copied().unwrap_or(0) != 0 && next >= 0.5;
+            let sign = if flip { -1.0 } else { 1.0 };
+            let base = range[axis] * r[axis] + sign * particle.rotate[axis];
+            let turn = sign * (speed[axis] + speed_random[axis] * (r[axis] + next) * 0.5);
+            out[axis] = base + turn * resisted(f32_at(raw, 0x72c), age);
+        }
+        out
+    }
+
+    /// A particle's colour `which` (0 or 1) and its opacity at `age` (Smash's
+    /// CalculateParticleColor0VecFromTime 0x10490 and Color1 0x10cc0): the constant colour
+    /// (res+0x9a0 / 0x9b0), or for colour type 3 a key picked by the particle's first random
+    /// value, or for type 2 the 8-key curve; the opacity's curve for opacity type 2. Then
+    /// times the colour scale (res+0x3b0) and the emitter's colour and opacity, which the game
+    /// passes from colour 0 for both (emitter+0x624 and +0x654, from res+0x7ac and 0x7b8), and,
+    /// when res+0x9e4 asks, the opacity times a wave (see [`wave`]), kept between 0 and 1.
+    fn colour_at(&self, which: usize, particle: &Live, age: f32) -> [f32; 4] {
+        let raw = self.raw;
+        let byte = |at: usize| raw.get(at).copied().unwrap_or(0);
+        let w = which;
+        let constant = 0x9a0 + 0x10 * w;
+        let mut out = [
+            f32_at(raw, constant),
+            f32_at(raw, constant + 4),
+            f32_at(raw, constant + 8),
+            f32_at(raw, constant + 12),
+        ];
+        let random = particle.random[0];
+        // Colour then opacity: type byte, key table, key count, loop flag, loop rate and
+        // random loop flag.
+        let colour = (0x99c + w, 0x3c0 + 0x100 * w, 0x60 + 8 * w, 0x8d8 + 2 * w);
+        let alpha = (0x99e + w, 0x440 + 0x100 * w, 0x64 + 8 * w, 0x8d9 + 2 * w);
+        let keys = |(_, table, count, looped): (usize, usize, usize, usize)| Keys {
+            table,
+            count: i32_at(raw, count),
+            loop_rate: if byte(looped) != 0 {
+                i32_at(raw, 0x8e4 + 4 * (looped - 0x8d8)) as f32
+            } else {
+                0.0
+            },
+            random_loop: byte(0x8dd + (looped - 0x8d8)) as f32,
+        };
+        match byte(colour.0) {
+            3 => {
+                let n = i32_at(raw, colour.2);
+                let i = (random * n as f32) as i32;
+                out[..3].copy_from_slice(&key(raw, colour.1, i).0.to_array());
+            }
+            2 if i32_at(raw, colour.2) >= 1 => {
+                let rgb = keys(colour).at(raw, random, age, particle.life);
+                out[..3].copy_from_slice(&rgb.to_array());
+            }
+            _ => {}
+        }
+        if byte(alpha.0) == 2 && i32_at(raw, alpha.2) >= 1 {
+            out[3] = keys(alpha).at(raw, random, age, particle.life).x;
+        }
+        let scale = f32_at(raw, 0x3b0);
+        for (c, value) in out.iter_mut().take(3).enumerate() {
+            *value *= f32_at(raw, 0x7ac + 4 * c) * scale;
+        }
+        out[3] *= f32_at(raw, 0x7b8);
+        if byte(0x9e4) != 0 {
+            out[3] *= wave(raw, random, age, 0);
+            out[3] = out[3].clamp(0.0, 1.0);
+        }
+        out
     }
 
     /// The next emission interval after an emission (Smash 0x30e0): res+0x808 frames plus one
@@ -939,17 +1121,25 @@ impl<'a> EmitterSim<'a> {
         v[10] = 0.0;
         v[11] = self.frame_rate;
         // MakeDynamicConstantBuffer: the fade-in where res+0x75b / 0x75c asks for it, times
-        // the fade-out after a kill where res+0x755 / 0x756 does.
+        // the fade-out after a kill where res+0x755 / 0x756 does. A child that takes its
+        // parent particle's opacity 0 or 1 every frame (res+0x7de with 0x7e2, res+0x7df with
+        // 0x7e3) multiplies that opacity by its parent emitter's, and its fade by its parent's.
         let on = |flag: usize| r.get(flag).copied().unwrap_or(0) != 0;
-        let fade = |fade_in: usize, fade_out: usize| {
-            (if on(fade_in) { self.fade_in } else { 1.0 })
-                * (if on(fade_out) { self.fade_out } else { 1.0 })
-        };
-        v[12] = fade(0x75b, 0x755);
+        let each = |alpha: usize, every: usize| self.parent.is_some() && on(alpha) && on(every);
+        if each(0x7de, 0x7e2) {
+            v[3] *= self.parent_alpha[0];
+        }
+        if each(0x7df, 0x7e3) {
+            v[7] *= self.parent_alpha[1];
+        }
+        v[12] = self.fade(0x75b, 0x755);
+        if each(0x7de, 0x7e2) || each(0x7df, 0x7e3) {
+            v[12] *= self.parent_fade;
+        }
         // The particle scale: the set's scale times the scale fade. Particles are drawn with
         // the unscaled matrix (`rt`) and this, so leaving the set's scale out drew every
         // particle of a scaled effect at size 1 while its emitter moved as scaled.
-        let fade_scale = fade(0x75c, 0x756);
+        let fade_scale = self.fade(0x75c, 0x756);
         v[13] = fade_scale * self.set_scale.x;
         v[14] = fade_scale * self.set_scale.y;
         v[15] = fade_scale * self.set_scale.z;
@@ -980,6 +1170,110 @@ fn res_matrix(raw: &[u8], rng: &mut Lcg) -> (Mat4, Mat4) {
     let rotate = Mat4::from_euler(glam::EulerRot::ZYX, rotation[2], rotation[1], rotation[0]);
     let rt = Mat4::from_translation(translation) * rotate;
     (rt * Mat4::from_scale(scale), rt)
+}
+
+/// Where a particle is for the children emitted from it: in its emitter's space, or in the
+/// world through its birth matrix when its emitter's particles keep it (`follows` false).
+fn anchor_of(particle: &Live, follows: bool) -> Vec3 {
+    if follows {
+        particle.position
+    } else {
+        particle.birth_matrix.transform_point3(particle.position)
+    }
+}
+
+/// A matrix's turn without its scale: each axis cut to length 1 (an emitter's matrix without
+/// scale, emitter+0x380).
+fn unscaled(m: &Mat4) -> glam::Mat3 {
+    glam::Mat3::from_cols(
+        m.x_axis.truncate().normalize_or_zero(),
+        m.y_axis.truncate().normalize_or_zero(),
+        m.z_axis.truncate().normalize_or_zero(),
+    )
+}
+
+/// Key `index` of the 8-key table at res+`table`: its value and time.
+fn key(raw: &[u8], table: usize, index: i32) -> (Vec3, f32) {
+    let at = table + 16 * index.clamp(0, 7) as usize;
+    (
+        Vec3::new(f32_at(raw, at), f32_at(raw, at + 4), f32_at(raw, at + 8)),
+        f32_at(raw, at + 12),
+    )
+}
+
+/// An 8-key curve as the CPU reads it (Smash 0xe400).
+struct Keys {
+    table: usize,
+    count: i32,
+    /// Frames one loop of the curve takes (0: the curve runs once over the life).
+    loop_rate: f32,
+    /// 1 when each particle starts its loop at a random point (its first random value).
+    random_loop: f32,
+}
+
+impl Keys {
+    /// The curve's value at `age` for a particle with first random value `random` and life
+    /// `life`: 1 with no keys, the first key with one; else the curve's place is age over life,
+    /// or with a loop rate the age (plus the random start) wrapped to the loop over the rate;
+    /// the first key before its time, the last from its time on, and between them a straight
+    /// line between the two keys around it.
+    fn at(&self, raw: &[u8], random: f32, age: f32, life: f32) -> Vec3 {
+        let n = self.count.min(8);
+        if n <= 0 {
+            return Vec3::ONE;
+        }
+        if n == 1 {
+            return key(raw, self.table, 0).0;
+        }
+        let t = if self.loop_rate > 0.0 {
+            (random * self.random_loop * self.loop_rate + age) % self.loop_rate / self.loop_rate
+        } else {
+            age / life
+        };
+        let last = key(raw, self.table, n - 1);
+        if last.1 <= t {
+            return last.0;
+        }
+        let first = key(raw, self.table, 0);
+        if t < first.1 {
+            return first.0;
+        }
+        for i in 0..n - 1 {
+            let (a, b) = (key(raw, self.table, i), key(raw, self.table, i + 1));
+            if a.1 <= t && t < b.1 {
+                return a.0 + (b.0 - a.0) * ((t - a.1) / (b.1 - a.1));
+            }
+        }
+        Vec3::ZERO
+    }
+}
+
+/// The wave res+0x9e4 puts on opacity and res+0x9e5 on scale (Smash 0xffe0, 0x10490): with
+/// `axis` 0 the X settings, 1 the Y ones (res+0xe0 amplitude, 0xe8 period, 0xf0 random phase,
+/// 0xf8 phase, each +4 for Y). Its place is (phase + age) / period plus the random phase times
+/// the particle's first random value; the kind (res+0x9e7, high four bits) makes it a cosine
+/// that dips to 1 - amplitude (0), a saw (1) or a square (2).
+fn wave(raw: &[u8], random: f32, age: f32, axis: usize) -> f32 {
+    let at = |base: usize| f32_at(raw, base + 4 * axis);
+    let (amplitude, period, random_phase, phase) = (at(0xe0), at(0xe8), at(0xf0), at(0xf8));
+    let place = (phase + age) / period + random_phase * random;
+    let part = place - place.floor();
+    match raw.get(0x9e7).copied().unwrap_or(0) >> 4 {
+        0 => 1.0 - amplitude * ((std::f32::consts::TAU * place).cos() + 1.0) * 0.5,
+        1 => (1.0 - amplitude * part).abs(),
+        2 => (1.0 - amplitude * if part < 0.5 { 1.0 } else { 0.0 }).abs(),
+        _ => 1.0,
+    }
+}
+
+/// How far a rotation turning at speed 1 has turned after `age` frames under the per-frame
+/// resistance `air`: the age itself at 1, else (1 - air^age) / (1 - air).
+fn resisted(air: f32, age: f32) -> f32 {
+    if air == 1.0 {
+        age
+    } else {
+        (1.0 - air.powf(age)) / (1.0 - air)
+    }
 }
 
 /// A world direction in the space of an emitter whose matrix is `m` (scale included): through
@@ -1239,5 +1533,314 @@ fn spawn_shape(
             Vec3::Y,
         ),
         _ => (Vec3::ZERO, rng.unit()),
+    }
+}
+
+/// Child inheritance against the game's own effects. Point VFX_GAME_EFFECTS at the game's
+/// `effect` folder (skipped when unset).
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{ptcl, static_block};
+
+    /// An emitter of a game effect with its children: parsed, and raw after load-time fixes.
+    struct Part {
+        data: EmitterData,
+        fixed: Vec<u8>,
+        children: Vec<Part>,
+    }
+
+    fn part(parsed: &effect_library::structs::Emitter, raw: &ptcl::Emitter) -> Part {
+        Part {
+            data: parsed.data.clone(),
+            fixed: static_block::fixed_emitter_data(raw, &|_| None, None),
+            children: parsed
+                .children
+                .iter()
+                .zip(&raw.children)
+                .map(|(p, r)| part(p, r))
+                .collect(),
+        }
+    }
+
+    /// Emitter `emitter` of the set named `set` in `file` (under the effect folder).
+    fn game_part(file: &str, set: &str, emitter: usize) -> Option<Part> {
+        let root = std::path::PathBuf::from(std::env::var_os("VFX_GAME_EFFECTS")?);
+        let data = std::fs::read(root.join(file)).unwrap();
+        let eff = effect_library::namco_file::NamcoEffectFile::load(&data).unwrap();
+        let index = eff
+            .entry_names
+            .iter()
+            .zip(&eff.entries)
+            .find(|(n, _)| n.as_str() == set)
+            .map(|(_, e)| e.emitter_set_id as usize - 1)
+            .unwrap();
+        let p = eff.ptcl_file.as_ref().unwrap();
+        let raw = &ptcl::emitter_sets(&p.base_bytes)[index].emitters[emitter];
+        Some(part(
+            &p.emitter_list.emitter_sets[index].emitters[emitter],
+            raw,
+        ))
+    }
+
+    fn sim(part: &Part) -> EmitterSim<'_> {
+        let mut s = EmitterSim::new(&part.data, &part.fixed);
+        for child in &part.children {
+            s.add_child(&child.data, &child.fixed);
+        }
+        s
+    }
+
+    fn put_f32(raw: &mut [u8], at: usize, value: f32) {
+        raw[at..at + 4].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn skipped() -> bool {
+        let unset = std::env::var_os("VFX_GAME_EFFECTS").is_none();
+        if unset {
+            eprintln!("VFX_GAME_EFFECTS not set; skipped");
+        }
+        unset
+    }
+
+    /// Steps until the first child has particles, then a few more.
+    fn run_until_child(s: &mut EmitterSim, child: usize, extra: usize) {
+        for _ in 0..200 {
+            s.step();
+            if s.children[child].count() > 0 {
+                break;
+            }
+        }
+        assert!(s.children[child].count() > 0, "the child never emitted");
+        for _ in 0..extra {
+            s.step();
+        }
+    }
+
+    /// The tester's case: Bayonetta's Witch Time clock hand (clock1, scale 5.4 x 30.3 x 5.4)
+    /// leaves a trail (trace1, scale 1) that takes its scale (res+0x7d9 is set in the game's
+    /// own file). The trail drew tiny because nothing took the hand's scale.
+    #[test]
+    fn the_clock_trail_takes_the_hands_scale() {
+        if skipped() {
+            return;
+        }
+        let file = "fighter/bayonetta/ef_bayonetta.eff";
+        let part = game_part(file, "BAYONETTA_WITCHTIME_CLOCK", 0).unwrap();
+        assert_eq!(part.children[0].fixed[0x7d9], 1);
+        let mut s = sim(&part);
+        run_until_child(&mut s, 0, 3);
+        let hand = s.particles[0].scale;
+        assert!((hand[1] - 30.28696).abs() < 1e-3, "{hand:?}");
+        for p in &s.children[0].particles {
+            assert_eq!(p.scale[..3], hand[..3]);
+        }
+        // Paired: with the flag cleared the trail keeps its own scale of 1.
+        let mut part = part;
+        part.children[0].fixed[0x7d9] = 0;
+        let mut s = sim(&part);
+        run_until_child(&mut s, 0, 3);
+        for p in &s.children[0].particles {
+            assert_eq!(p.scale[..3], [1.0; 3]);
+        }
+    }
+
+    /// The scale rate (res+0x7ec) multiplies what is taken.
+    #[test]
+    fn the_scale_rate_multiplies_the_taken_scale() {
+        if skipped() {
+            return;
+        }
+        let file = "fighter/bayonetta/ef_bayonetta.eff";
+        let mut part = game_part(file, "BAYONETTA_WITCHTIME_CLOCK", 0).unwrap();
+        put_f32(&mut part.children[0].fixed, 0x7ec, 0.5);
+        let mut s = sim(&part);
+        run_until_child(&mut s, 0, 1);
+        let hand = s.particles[0].scale;
+        let trail = s.children[0].particles[0].scale;
+        for axis in 0..3 {
+            assert!(
+                (trail[axis] - hand[axis] * 0.5).abs() < 1e-4,
+                "{trail:?} {hand:?}"
+            );
+        }
+    }
+
+    /// Roy's Blazer eruption: each flare2 spark turns by a random share of half a turn about Z
+    /// (res+0x718 = pi, no initial angle, no spin), and the smoke3 puffs it leaves take that
+    /// angle (res+0x7da), where they had their own initial angle of 0.
+    #[test]
+    fn the_eruption_smoke_takes_its_sparks_angle() {
+        if skipped() {
+            return;
+        }
+        let file = "fighter/roy/ef_roy.eff";
+        let part = game_part(file, "ROY_ERUPTION", 5).unwrap();
+        let child = &part.children[0];
+        assert_eq!(child.fixed[0x7da], 1);
+        assert_eq!(f32_at(&child.fixed, 0x708), 0.0);
+        let mut s = sim(&part);
+        run_until_child(&mut s, 0, 2);
+        let angles: Vec<f32> = s
+            .particles
+            .iter()
+            .map(|p| std::f32::consts::PI * p.random[2])
+            .collect();
+        let children = &s.children[0].particles;
+        assert!(!children.is_empty());
+        for p in children {
+            assert!(p.rotate[2] != 0.0);
+            assert!(
+                angles.iter().any(|a| (a - p.rotate[2]).abs() < 1e-5),
+                "{} not one of {angles:?}",
+                p.rotate[2]
+            );
+        }
+        // Paired: with the flag cleared the puffs keep their own angle.
+        let mut part = part;
+        part.children[0].fixed[0x7da] = 0;
+        let mut s = sim(&part);
+        run_until_child(&mut s, 0, 2);
+        assert!(s.children[0].particles.iter().all(|p| p.rotate[2] == 0.0));
+    }
+
+    /// Sephiroth's charged fire sparks (sparks4) hand their colours to Emitter1. The game
+    /// multiplies what it hands by the spark's colour scale (res+0x3b0, 2 here), and passes
+    /// colour 1 the emitter's colour 0, not its colour 1 (Smash 0x9ab0 hands both
+    /// CalculateParticleColor0/1VecFromTime emitter+0x624 and +0x654).
+    #[test]
+    fn colours_taken_carry_the_colour_scale_and_the_emitters_colour_0() {
+        if skipped() {
+            return;
+        }
+        let file = "fighter/edge/ef_edge.eff";
+        let base = game_part(file, "EDGE_FIRE2_HOLD", 11).unwrap();
+        assert_eq!(base.children[0].fixed[0x7dc..0x7e0], [1, 1, 1, 1]);
+        let colours = |edit: &dyn Fn(&mut Vec<u8>)| {
+            let mut part = game_part(file, "EDGE_FIRE2_HOLD", 11).unwrap();
+            edit(&mut part.fixed);
+            let mut s = sim(&part);
+            run_until_child(&mut s, 0, 2);
+            s.children[0].particles[0].colours
+        };
+        let plain = colours(&|_| {});
+        let scaled = colours(&|raw| {
+            let scale = f32_at(raw, 0x3b0);
+            put_f32(raw, 0x3b0, scale * 2.0);
+        });
+        let red0 = colours(&|raw| put_f32(raw, 0x7ac, 0.5));
+        let red1 = colours(&|raw| put_f32(raw, 0x7bc, 0.5));
+        for k in 0..2 {
+            for c in 0..3 {
+                assert!((scaled[k][c] - plain[k][c] * 2.0).abs() < 1e-4);
+            }
+            assert_eq!(scaled[k][3], plain[k][3]);
+            assert!((red0[k][0] - plain[k][0] * 0.5).abs() < 1e-4);
+            assert_eq!(red1[k][0], plain[k][0]);
+        }
+        assert!(plain[0][0] > 0.0 && plain[1][0] > 0.0);
+    }
+
+    /// Marshadow's Shadow Steel winds (wind1) take their shadow's opacities every frame
+    /// (res+0x7e2, 0x7e3): the wind's opacities and fade multiply by its parent emitter's.
+    #[test]
+    fn opacity_taken_every_frame_follows_the_parent_emitter() {
+        if skipped() {
+            return;
+        }
+        let file = "pokemon/marshadow/ef_marshadow.eff";
+        let mut part = game_part(file, "MARSHADOW_SHADOW_STEEL", 2).unwrap();
+        assert_eq!(part.children[0].fixed[0x7de..0x7e4], [1, 1, 1, 1, 1, 1]);
+        put_f32(&mut part.fixed, 0x7b8, 0.5);
+        put_f32(&mut part.fixed, 0x7c8, 0.25);
+        let row = |s: &EmitterSim| {
+            let block = s.dynamic_block(&Mat4::IDENTITY, &Mat4::IDENTITY, [1.0; 4]);
+            let f = |at: usize| f32::from_le_bytes(block[at..at + 4].try_into().unwrap());
+            [f(0x0c), f(0x1c), f(0x30)]
+        };
+        let mut s = sim(&part);
+        run_until_child(&mut s, 0, 1);
+        let own = [
+            f32_at(&part.children[0].fixed, 0x7b8),
+            f32_at(&part.children[0].fixed, 0x7c8),
+        ];
+        let [a0, a1, fade] = row(&s.children[0]);
+        assert_eq!([a0, a1, fade], [own[0] * 0.5, own[1] * 0.25, 1.0]);
+        // The shadow fades out over res+0x768 = 4 frames once killed; so does the wind.
+        assert_eq!(part.fixed[0x755], 1);
+        s.kill();
+        s.step();
+        s.step();
+        let parent_fade = row(&s)[2];
+        assert!(parent_fade > 0.0 && parent_fade < 1.0);
+        assert_eq!(
+            row(&s.children[0])[2],
+            s.children[0].fade(0x75b, 0x755) * parent_fade
+        );
+        // Paired: without the every-frame flags the wind keeps its own.
+        part.children[0].fixed[0x7e2] = 0;
+        part.children[0].fixed[0x7e3] = 0;
+        let mut s = sim(&part);
+        run_until_child(&mut s, 0, 1);
+        assert_eq!(row(&s.children[0]), [own[0], own[1], 1.0]);
+    }
+
+    /// Yoshi's Final Smash stars (star1) each carry their own starline1 emitter (res+0x7e4):
+    /// the game places that emitter at its star every frame, so the line's particles, which
+    /// follow their emitter, move with the star.
+    #[test]
+    fn a_child_per_particle_rides_with_its_parent_particle() {
+        if skipped() {
+            return;
+        }
+        let file = "fighter/yoshi/ef_yoshi.eff";
+        let part = game_part(file, "YOSHI_FINAL_HIT", 8).unwrap();
+        let child = &part.children[0];
+        assert_eq!((child.fixed[0x7e4], child.fixed[0x753]), (1, 0));
+        let mut s = sim(&part);
+        run_until_child(&mut s, 0, 2);
+        let own = s.children[0].local;
+        let before: HashMap<u64, Vec3> = s.children[0]
+            .particles
+            .iter()
+            .map(|p| (p.id, p.position))
+            .collect();
+        let stars: HashMap<u64, Vec3> = s.particles.iter().map(|p| (p.id, p.position)).collect();
+        s.step();
+        let mut checked = 0;
+        for p in &s.children[0].particles {
+            let (Some(was), Some((star, _))) = (before.get(&p.id), p.anchor) else {
+                continue;
+            };
+            let Some(now) = s.particles.iter().find(|q| q.id == star) else {
+                continue;
+            };
+            let moved = own.inverse().transform_vector3(now.position - stars[&star]);
+            assert!(moved.length() > 1e-3, "the star stood still");
+            let expected = *was + p.diff + moved;
+            assert!(
+                (p.position - expected).length() < 1e-3,
+                "{} {expected}",
+                p.position
+            );
+            checked += 1;
+        }
+        assert!(checked > 0);
+        // Paired: one shared starline emitter leaves its particles where they were made.
+        let mut part = part;
+        part.children[0].fixed[0x7e4] = 0;
+        let mut s = sim(&part);
+        run_until_child(&mut s, 0, 2);
+        let before: HashMap<u64, Vec3> = s.children[0]
+            .particles
+            .iter()
+            .map(|p| (p.id, p.position))
+            .collect();
+        s.step();
+        for p in &s.children[0].particles {
+            if let Some(was) = before.get(&p.id) {
+                assert!((p.position - (*was + p.diff)).length() < 1e-5);
+            }
+        }
     }
 }
