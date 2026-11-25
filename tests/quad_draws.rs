@@ -4,8 +4,8 @@
 //! Quads take every particle stream per instance and nothing per vertex. They were once laid
 //! out behind an attribute-less vertex buffer and read zeros, so every billboard collapsed to a
 //! point while mesh emitters still drew.
-use glam::{Mat4, Vec3};
 use eff_wgpu::{bnsh, ptcl, render, sim, static_block, texture, view_block};
+use glam::{Mat4, Vec3};
 
 #[test]
 fn mario_fireball_flame_quads_cover_pixels() {
@@ -114,6 +114,7 @@ fn mario_fireball_flame_quads_cover_pixels() {
     let draw = render::EmitterDraw {
         program: parsed.shader_references.shader_index as usize,
         state: render::RenderState {
+            output: render::Output::Colour,
             blend: render::Blend::from_type(rs.is_blend_enable, rs.blend_type),
             depth_test: false,
             depth_write: false,
@@ -183,7 +184,11 @@ fn mario_fireball_flame_quads_cover_pixels() {
     queue.submit([encoder.finish()]);
     readback.slice(..).map_async(wgpu::MapMode::Read, |_| {});
     device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
-    let pixels = readback.slice(..).get_mapped_range().expect("mapped").to_vec();
+    let pixels = readback
+        .slice(..)
+        .get_mapped_range()
+        .expect("mapped")
+        .to_vec();
     let lit = pixels.chunks_exact(4).filter(|p| p[0] > 32).count();
     assert!(lit > 500, "only {lit} pixels lit");
 }

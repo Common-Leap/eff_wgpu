@@ -7,6 +7,9 @@
 //! set distance of the scene behind them (Kazuya's ground cracks), so they draw on the floor
 //! and nowhere else. Without a copy the renderer falls back to a flat colour and to depth 1.0,
 //! where refraction draws as a solid sheet and every floor decal is discarded.
+//!
+//! After them comes the distortion pass ([Distortion]), for the emitters whose shaders write how
+//! far to move the picture instead of a colour (`render::Output::Offsets`).
 
 /// Where the copies go: colour in the scene's own format, depth as one float per pixel, which
 /// the effect shaders read as an ordinary texture.
@@ -121,6 +124,21 @@ impl Copier {
     }
 }
 
+/// A copy of a single-sampled colour target.
+fn colour_copier(device: &wgpu::Device, format: wgpu::TextureFormat) -> Copier {
+    Copier::new(
+        device,
+        wgpu::BindingType::Texture {
+            sample_type: wgpu::TextureSampleType::Float { filterable: false },
+            view_dimension: wgpu::TextureViewDimension::D2,
+            multisampled: false,
+        },
+        "texture_2d<f32>",
+        "textureLoad(source, texel(at), 0)",
+        format,
+    )
+}
+
 /// Copies of a scene's colour and depth, sized to it, for [crate::render::EffectRenderer::set_scene].
 pub struct SceneCopy {
     colour_format: wgpu::TextureFormat,
@@ -139,17 +157,7 @@ impl SceneCopy {
         colour_format: wgpu::TextureFormat,
         depth_samples: u32,
     ) -> Self {
-        let colour = Copier::new(
-            device,
-            wgpu::BindingType::Texture {
-                sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                view_dimension: wgpu::TextureViewDimension::D2,
-                multisampled: false,
-            },
-            "texture_2d<f32>",
-            "textureLoad(source, texel(at), 0)",
-            colour_format,
-        );
+        let colour = colour_copier(device, colour_format);
         let multisampled = depth_samples > 1;
         let depth = Copier::new(
             device,
@@ -237,6 +245,249 @@ impl SceneCopy {
     ) {
         self.colour.run(device, encoder, colour, &self.colour_view);
         self.depth.run(device, encoder, depth, &self.depth_view);
+    }
+}
+
+/// What [Distortion] draws the offsets into: two signed floats a pixel, in screen UV.
+pub const OFFSETS_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rg16Float;
+
+const BEND: &str = r#"
+@vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
+    let uv = vec2<f32>(f32((i << 1u) & 2u), f32(i & 2u));
+    return vec4<f32>(uv * 2.0 - 1.0, 0.0, 1.0);
+}
+@group(0) @binding(0) var scene: texture_2d<f32>;
+@group(0) @binding(1) var offsets: texture_2d<f32>;
+@group(0) @binding(2) var sampling: sampler;
+@fragment fn main(@builtin(position) at: vec4<f32>) -> @location(0) vec4<f32> {
+    let uv = at.xy / vec2<f32>(textureDimensions(scene));
+    let offset = textureSampleLevel(offsets, sampling, uv, 0.0).xy;
+    // Left as it is, every sample of the pixel: only what moves is drawn again.
+    if all(offset == vec2<f32>(0.0)) {
+        discard;
+    }
+    return textureSampleLevel(scene, sampling, uv + offset, 0.0);
+}
+"#;
+
+struct Offsets {
+    size: (u32, u32),
+    drawn: wgpu::TextureView,
+    resolved: wgpu::TextureView,
+    scene: wgpu::TextureView,
+}
+
+/// The game's distortion pass. The emitters that write offsets draw into a buffer of their own,
+/// and the finished scene is then read at each pixel's UV plus its offset (the game's
+/// 3d_final_00000100_PS and its siblings in render/shader/bin/3dfinal.*.nushdb: `tex0(uv +
+/// tex1(uv).xy)`, clamped to the frame). The game's buffer is half size; this one is the
+/// scene's, with its samples, so the scene's own depth hides what it should.
+pub struct Distortion {
+    colour_format: wgpu::TextureFormat,
+    samples: u32,
+    copier: Copier,
+    layout: wgpu::BindGroupLayout,
+    pipeline: wgpu::RenderPipeline,
+    sampler: wgpu::Sampler,
+    /// Made when something first draws offsets.
+    offsets: Option<Offsets>,
+}
+
+impl Distortion {
+    /// For a scene drawn into a `colour_format` target with `samples` samples per pixel and
+    /// resolved into a single-sampled one.
+    pub fn new(device: &wgpu::Device, colour_format: wgpu::TextureFormat, samples: u32) -> Self {
+        let texture = |binding, filterable| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Float { filterable },
+                view_dimension: wgpu::TextureViewDimension::D2,
+                multisampled: false,
+            },
+            count: None,
+        };
+        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("vfx distortion"),
+            entries: &[
+                texture(0, true),
+                texture(1, true),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("vfx distortion"),
+            source: wgpu::ShaderSource::Wgsl(BEND.into()),
+        });
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("vfx distortion"),
+            bind_group_layouts: &[Some(&layout)],
+            immediate_size: 0,
+        });
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("vfx distortion"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &module,
+                entry_point: Some("vs"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            primitive: Default::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState {
+                count: samples,
+                ..Default::default()
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &module,
+                entry_point: Some("main"),
+                compilation_options: Default::default(),
+                targets: &[Some(colour_format.into())],
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
+        Self {
+            colour_format,
+            samples,
+            copier: colour_copier(device, colour_format),
+            layout,
+            pipeline,
+            sampler: device.create_sampler(&wgpu::SamplerDescriptor {
+                label: Some("vfx distortion"),
+                mag_filter: wgpu::FilterMode::Linear,
+                min_filter: wgpu::FilterMode::Linear,
+                ..Default::default()
+            }),
+            offsets: None,
+        }
+    }
+
+    /// Fit the buffers to a scene. Call before [Self::begin], only when something draws offsets:
+    /// without any, nothing is allocated.
+    pub fn fit(&mut self, device: &wgpu::Device, width: u32, height: u32) {
+        let size = (width.max(1), height.max(1));
+        if self.offsets.as_ref().is_some_and(|made| made.size == size) {
+            return;
+        }
+        let make = |label, format, sample_count| {
+            device
+                .create_texture(&wgpu::TextureDescriptor {
+                    label: Some(label),
+                    size: wgpu::Extent3d {
+                        width: size.0,
+                        height: size.1,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count,
+                    dimension: wgpu::TextureDimension::D2,
+                    format,
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                        | wgpu::TextureUsages::TEXTURE_BINDING,
+                    view_formats: &[],
+                })
+                .create_view(&Default::default())
+        };
+        self.offsets = Some(Offsets {
+            size,
+            drawn: make("vfx offsets drawn", OFFSETS_FORMAT, self.samples),
+            resolved: make("vfx offsets", OFFSETS_FORMAT, 1),
+            scene: make("vfx distortion scene", self.colour_format, 1),
+        });
+    }
+
+    /// The pass the emitters that write offsets draw into, hidden by the scene's `depth`.
+    /// `None` until [Self::fit].
+    pub fn begin<'e>(
+        &self,
+        encoder: &'e mut wgpu::CommandEncoder,
+        depth: &wgpu::TextureView,
+    ) -> Option<wgpu::RenderPass<'e>> {
+        let offsets = self.offsets.as_ref()?;
+        let resolves = self.samples > 1;
+        Some(encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("vfx offsets"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: if resolves {
+                    &offsets.drawn
+                } else {
+                    &offsets.resolved
+                },
+                resolve_target: resolves.then_some(&offsets.resolved),
+                depth_slice: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: depth,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                }),
+                stencil_ops: None,
+            }),
+            ..Default::default()
+        }))
+    }
+
+    /// Move the scene by the offsets drawn since [Self::begin]. `color` is what it is drawn
+    /// into and `resolve` its single-sampled picture; both end up moved. A scene with one
+    /// sample per pixel has only `resolve`.
+    pub fn bend(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        color: &wgpu::TextureView,
+        resolve: &wgpu::TextureView,
+    ) {
+        let Some(offsets) = &self.offsets else {
+            return;
+        };
+        self.copier.run(device, encoder, resolve, &offsets.scene);
+        let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("vfx distortion"),
+            layout: &self.layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&offsets.scene),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&offsets.resolved),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+            ],
+        });
+        let resolves = self.samples > 1;
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("vfx distortion"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: if resolves { color } else { resolve },
+                resolve_target: resolves.then_some(resolve),
+                depth_slice: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            ..Default::default()
+        });
+        pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(0, &group, &[]);
+        pass.draw(0..3, 0..1);
     }
 }
 

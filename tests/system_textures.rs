@@ -4,9 +4,9 @@
 //! The layout once stopped at the emitter's three samplers, so these ~2,900 shader stages failed
 //! pipeline creation and wgpu's default handler aborted the editor on Mario's F.L.U.D.D. hit
 //! and Final Smash moves.
+use eff_wgpu::{bnsh, ptcl, render, sim, static_block};
 use glam::Mat4;
 use std::sync::{Arc, Mutex};
-use eff_wgpu::{bnsh, ptcl, render, sim, static_block};
 
 #[test]
 fn frame_and_depth_reading_emitters_prepare_without_errors() {
@@ -81,6 +81,7 @@ fn frame_and_depth_reading_emitters_prepare_without_errors() {
                 let draw = render::EmitterDraw {
                     program: e.data.shader_references.shader_index.max(0) as usize,
                     state: render::RenderState {
+                        output: render::Output::Colour,
                         blend: render::Blend::Normal,
                         depth_test: false,
                         depth_write: false,

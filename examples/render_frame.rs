@@ -1,7 +1,7 @@
 //! cargo run --example render_frame -- ef_x.eff SET FRAME out.png
 //! Draws one emitter set FRAME frames after it starts, with the game's shaders, white textures.
-use glam::{Mat4, Vec3};
 use eff_wgpu::{bnsh, ptcl, render, sim, static_block, view_block};
+use glam::{Mat4, Vec3};
 
 fn main() {
     let a: Vec<String> = std::env::args().collect();
@@ -95,16 +95,37 @@ fn main() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(40.0);
-    let eye = Vec3::new(0.0, 0.0, distance);
-    let cam = glam::camera::rh::view::look_at_mat4(eye, Vec3::ZERO, Vec3::Y);
-    let proj = glam::camera::rh::proj::directx::perspective(45f32.to_radians(), 1.0, 1.0, 1000.0);
+    // CAM_YAW=degrees: turn the camera around the origin.
+    let yaw: f32 = std::env::var("CAM_YAW")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0.0f32)
+        .to_radians();
+    let eye = Vec3::new(distance * yaw.sin(), 0.0, distance * yaw.cos());
+    let mut cam = glam::camera::rh::view::look_at_mat4(eye, Vec3::ZERO, Vec3::Y);
+    let mut proj =
+        glam::camera::rh::proj::directx::perspective(45f32.to_radians(), 1.0, 1.0, 1000.0);
+    let mut eye = eye;
+    let (mut near, mut far) = (1.0f32, 1000.0f32);
+    // EDITOR_CAM=1: Visionary's default preview camera (renderer.rs Camera::default).
+    if std::env::var_os("EDITOR_CAM").is_some() {
+        cam = Mat4::from_translation(Vec3::new(0.0, -8.0, -60.0))
+            * Mat4::from_euler(glam::EulerRot::XYZ, 0.0, std::f32::consts::FRAC_PI_2, 0.0);
+        far = std::env::var("FAR")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(400_000.0);
+        proj = glam::camera::rh::proj::directx::perspective(30f32.to_radians(), 1.0, near, far);
+        eye = cam.inverse().col(3).truncate();
+    }
+    near = near.max(1.0);
     let rows = |m: Mat4| m.transpose().to_cols_array_2d();
     if let Ok(path) = std::env::var("VIEW_FILE") {
         renderer.set_view(&queue, &std::fs::read(path).unwrap());
     } else {
         renderer.set_view(
             &queue,
-            &view_block::view_block(&rows(cam), &rows(proj), eye.into(), 1.0, 1000.0, 1.0),
+            &view_block::view_block(&rows(cam), &rows(proj), eye.into(), near, far, 1.0),
         );
     }
 
@@ -118,7 +139,17 @@ fn main() {
         ));
     }
     let only: Option<usize> = std::env::var("ONLY").ok().and_then(|v| v.parse().ok());
-    let meshes = eff_wgpu::mesh::meshes(&ptcl_file);
+    let mut meshes = eff_wgpu::mesh::meshes(&ptcl_file);
+    // FLIP_Z: mirror every mesh through its XY plane (positions and normals), to test which way
+    // a mesh faces the camera.
+    if std::env::var_os("FLIP_Z").is_some() {
+        for m in meshes.values_mut() {
+            for v in &mut m.vertices {
+                v[0][2] = -v[0][2];
+                v[2][2] = -v[2][2];
+            }
+        }
+    }
     let ids: Vec<u64> = ptcl_file
         .texture_info
         .as_ref()
@@ -196,6 +227,7 @@ fn main() {
         let draw = render::EmitterDraw {
             program,
             state: render::RenderState {
+                output: render::Output::Colour,
                 blend: render::Blend::from_type(rs.is_blend_enable, rs.blend_type),
                 depth_test: false,
                 depth_write: false,
@@ -294,7 +326,11 @@ fn main() {
     queue.submit([encoder.finish()]);
     readback.slice(..).map_async(wgpu::MapMode::Read, |_| {});
     device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
-    let pixels = readback.slice(..).get_mapped_range().expect("mapped").to_vec();
+    let pixels = readback
+        .slice(..)
+        .get_mapped_range()
+        .expect("mapped")
+        .to_vec();
     let file = std::fs::File::create(out).unwrap();
     let mut enc = png::Encoder::new(file, width, height);
     enc.set_color(png::ColorType::Rgba);

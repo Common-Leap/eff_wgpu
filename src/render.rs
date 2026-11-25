@@ -95,8 +95,35 @@ impl Blend {
     }
 }
 
+/// What an emitter's pixel shader writes, which its draw path (res+0x7d4 in the emitter's data,
+/// `emitter_info.draw_path`) decides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Output {
+    /// A colour, into the scene.
+    Colour,
+    /// How far to move the picture behind it, into the game's distortion buffer: (value - 0.5)
+    /// times the part's strength over (960, 540), in screen UV (see `scene::Distortion`).
+    Offsets,
+}
+
+impl Output {
+    /// Draw paths 12 and 16 hold every emitter of custom shader 5 in the game (22 of 37,420:
+    /// Ryu's final smash wave, Sephiroth's down throw, Bayonetta's bats and stilettos); drawn
+    /// as colour, their offsets are black. Path 6 holds every emitter of custom shader 6 (65,
+    /// all named radialblur but one), which write a velocity for the game's motion blur: there
+    /// is none here, so nothing to draw.
+    pub fn of_draw_path(path: u8) -> Option<Self> {
+        match path {
+            6 => None,
+            12 | 16 => Some(Output::Offsets),
+            _ => Some(Output::Colour),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct RenderState {
+    pub output: Output,
     pub blend: Blend,
     pub depth_test: bool,
     pub depth_write: bool,
@@ -217,7 +244,7 @@ pub struct EffectRenderer {
     programs: Vec<Program>,
     /// The caches sit behind locks so a worker thread can compile ahead (`warm`) while the
     /// paint thread draws what is ready. Compiling happens outside the locks.
-    compiled: Mutex<HashMap<usize, Result<Arc<Compiled>, String>>>,
+    compiled: Mutex<HashMap<(usize, bool), Result<Arc<Compiled>, String>>>,
     /// `None` for a pipeline wgpu rejected: that emitter is skipped rather than drawn.
     pipelines: Mutex<HashMap<PipelineKey, Option<wgpu::RenderPipeline>>>,
     /// Shader or pipeline errors caught since the last `take_failures`.
@@ -395,7 +422,7 @@ impl EffectRenderer {
 
     /// Why a program can't be drawn, if it can't.
     pub fn program_error(&self, program: usize) -> Option<String> {
-        self.compile(program).err()
+        self.compile(program, Output::Colour).err()
     }
 
     /// Run an emitter's vertex shader on the GPU as compute and read back what it outputs:
@@ -408,7 +435,11 @@ impl EffectRenderer {
     ) -> Option<(Vec<u32>, Vec<[f32; 4]>)> {
         use wgpu::util::DeviceExt;
         let prepared = self.prepare(queue, draw)?;
-        let c_group1 = self.compile(draw.program).ok()?.group1.clone();
+        let c_group1 = self
+            .compile(draw.program, draw.state.output)
+            .ok()?
+            .group1
+            .clone();
         let program = self.programs.get(draw.program)?;
         let vs = program.stages[crate::bnsh::STAGE_VERTEX].as_ref()?;
         let t = wgsl::translate(
@@ -516,7 +547,7 @@ impl EffectRenderer {
     }
 
     fn instance_bytes(&self, draw: &EmitterDraw, iface: &wgsl::Interface, count: u32) -> Vec<u8> {
-        let Ok(c) = self.compile(draw.program) else {
+        let Ok(c) = self.compile(draw.program, draw.state.output) else {
             return Vec::new();
         };
         let by_location: HashMap<u32, &str> =
@@ -536,24 +567,25 @@ impl EffectRenderer {
         out
     }
 
-    fn compile(&self, program: usize) -> Result<Arc<Compiled>, String> {
-        if let Some(made) = lock(&self.compiled).get(&program) {
+    fn compile(&self, program: usize, output: Output) -> Result<Arc<Compiled>, String> {
+        // Only a colour is encoded: an offset is a number, negative as often as not.
+        let encode = output == Output::Colour && encodes_srgb(self.target);
+        if let Some(made) = lock(&self.compiled).get(&(program, encode)) {
             return made.clone();
         }
         let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
-        let mut made = Self::compile_program(
-            &self.device,
-            self.programs.get(program),
-            encodes_srgb(self.target),
-        )
-        .map(Arc::new);
+        let mut made =
+            Self::compile_program(&self.device, self.programs.get(program), encode).map(Arc::new);
         if let Some(error) = caught(scope) {
             let message = format!("program {program}: {error}");
             lock(&self.failures).push(message.clone());
             made = Err(message);
         }
         // Another thread may have compiled it meanwhile; keep the first so both agree.
-        lock(&self.compiled).entry(program).or_insert(made).clone()
+        lock(&self.compiled)
+            .entry((program, encode))
+            .or_insert(made)
+            .clone()
     }
 
     fn compile_program(
@@ -653,7 +685,7 @@ impl EffectRenderer {
         state: RenderState,
         mesh: bool,
     ) -> Option<wgpu::RenderPipeline> {
-        let c = self.compile(program).ok()?;
+        let c = self.compile(program, state.output).ok()?;
         if let Some(made) = lock(&self.pipelines).get(&(program, state, mesh)) {
             return made.clone();
         }
@@ -760,7 +792,10 @@ impl EffectRenderer {
                         entry_point: Some("main"),
                         compilation_options: Default::default(),
                         targets: &[Some(wgpu::ColorTargetState {
-                            format: self.target,
+                            format: match state.output {
+                                Output::Colour => self.target,
+                                Output::Offsets => crate::scene::OFFSETS_FORMAT,
+                            },
                             blend: state.blend.state(),
                             write_mask: wgpu::ColorWrites::ALL,
                         })],
@@ -791,7 +826,7 @@ impl EffectRenderer {
         }
         let mesh = draw.mesh.is_some();
         let pipeline = self.pipeline(draw.program, draw.state, mesh)?;
-        let c = self.compile(draw.program).ok()?;
+        let c = self.compile(draw.program, draw.state.output).ok()?;
         let make = |label: &str, bytes: &[u8], usage: wgpu::BufferUsages, size: u64| {
             let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some(label),
