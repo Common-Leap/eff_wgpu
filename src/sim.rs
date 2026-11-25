@@ -75,6 +75,8 @@ fn f32_at(b: &[u8], at: usize) -> f32 {
         .unwrap_or(0.0)
 }
 
+pub use crate::anim::Anims;
+use crate::anim::{Slot, Values};
 pub use crate::field::{Convergence, CurlNoise, Fields, PositionAdd, Spin};
 
 /// Live particles one emitter keeps, the most the renderer draws in one call.
@@ -139,6 +141,9 @@ pub struct EmitterSim<'a> {
     /// Set when the effect is killed (`EFFECT_OFF_KIND`; the game's fade request).
     killed: bool,
     fields: Fields,
+    anims: Anims,
+    /// What the emitter animations leave the emitter's values at this frame.
+    values: Values,
     /// Fade-out after a kill (emitter+0x70): 1 to 0 over res+0x768 frames when res+0x755
     /// (alpha) or res+0x756 (scale) asks for it.
     fade_out: f32,
@@ -195,6 +200,8 @@ impl<'a> EmitterSim<'a> {
             next_id: 0,
             killed: false,
             fields: Fields::default(),
+            anims: Anims::default(),
+            values: Values::of(raw),
             fade_out: 1.0,
             finished: false,
             frame_rate: 1.0,
@@ -248,6 +255,18 @@ impl<'a> EmitterSim<'a> {
     /// move only by their velocity, gravity and air resistance.
     pub fn set_fields(&mut self, fields: Fields) {
         self.fields = fields;
+    }
+
+    /// Run the emitter's animation sections (see [`Anims`]). Without this its values stay as
+    /// the file has them.
+    pub fn set_anims(&mut self, anims: Anims) {
+        self.anims = anims;
+    }
+
+    /// Run the emitter animations at `time`. The emitter's matrix follows when its place, turn
+    /// or size is animated.
+    fn run_anims(&mut self, time: f32) {
+        self.values.run(&self.anims, time, self.raw);
     }
 
     /// The child emitters, each drawn as its own emitter.
@@ -342,12 +361,13 @@ impl<'a> EmitterSim<'a> {
             let (mut position, normal) = spawn_shape(
                 data,
                 raw,
+                self.values.get(Slot::ShapeScale),
                 &mut self.rng,
                 &mut self.divide_counter,
                 batch,
                 index,
             );
-            let mut outward = normal * velocity.all_direction;
+            let mut outward = normal * self.values.x(Slot::Outward);
             // XZ diffusion (res+0x97c): outward across the emitter's Y axis from its centre, a
             // random way for a particle on the axis.
             let xz = f32_at(raw, 0x97c);
@@ -388,7 +408,7 @@ impl<'a> EmitterSim<'a> {
                 let ring = (1.0 - height * height).max(0.0).sqrt();
                 from_y(designated) * Vec3::new(ring * around.cos(), height, ring * around.sin())
             };
-            let mut vel = (outward + along * velocity.designated_dir_scale) * speed;
+            let mut vel = (outward + along * self.values.x(Slot::Directed)) * speed;
             // Random velocity per axis (res+0x980) from the cube table, then the emitter's own
             // movement (emitter+0x3d0) times res+0x990: Sephiroth's charge sparks drop gold
             // dots that drift in after them (0.2), so each trail stretches as it goes.
@@ -410,10 +430,11 @@ impl<'a> EmitterSim<'a> {
             };
             let spread = f32_at(raw, 0x8c0);
             let w = 1.0 + spread * (1.0 - 2.0 * self.rng.next());
+            let size = self.values.get(Slot::ParticleScale);
             let mut scale4 = [
-                f32_at(raw, 0x9c0) * factors[0],
-                f32_at(raw, 0x9c4) * factors[1],
-                f32_at(raw, 0x9c8) * factors[2],
+                size.x * factors[0],
+                size.y * factors[1],
+                size.z * factors[2],
                 w,
             ];
             if let Some(s) = inherit.scale {
@@ -424,7 +445,7 @@ impl<'a> EmitterSim<'a> {
                 268_435_456.0
             } else {
                 let draw = self.rng.below(i32_at(raw, 0x8bc));
-                i32_at(raw, 0x8b8) as f32 * (1.0 - draw * 0.01)
+                self.values.x(Slot::Life) * (1.0 - draw * 0.01)
             };
             let random = [
                 self.rng.next(),
@@ -483,6 +504,10 @@ impl<'a> EmitterSim<'a> {
     /// that moves between frames is what distance emission measures, and each new particle
     /// keeps the matrix it was born with.
     pub fn step_at(&mut self, set: &Mat4) {
+        self.run_anims(self.time);
+        if self.anims.moves_emitter() {
+            (self.local, self.local_rt) = self.values.matrix(&self.anims);
+        }
         self.current = *set * self.local;
         self.set_scale = set.to_scale_rotation_translation().0;
         let translation = self.current.w_axis.truncate();
@@ -552,7 +577,7 @@ impl<'a> EmitterSim<'a> {
             // Time emission (Smash 0x7c30, the res+0x7f2 == 0 branch).
             if self.timer >= self.interval {
                 let r = self.rng.next();
-                let rate = emission.rate - emission.rate * rate_random * r;
+                let rate = self.rate() - self.res_rate() * rate_random * r;
                 self.accumulated = (self.accumulated + rate).max(0.0);
                 let n = self.accumulated as i32;
                 if n == 0 {
@@ -570,13 +595,7 @@ impl<'a> EmitterSim<'a> {
             }
         }
         self.previous_translation = Some(translation);
-        let statics = &self.data.emitter_static;
-        let gravity = Vec3::new(
-            statics.gravity_dir_x,
-            statics.gravity_dir_y,
-            statics.gravity_dir_z,
-        ) * statics.gravity_scale;
-        let air = statics.air_res;
+        let (gravity, air) = self.pull();
         self.move_particles(gravity, air);
         self.time += step;
         // A particle draws `life` times, the frame it is born included: the game ages and
@@ -653,15 +672,20 @@ impl<'a> EmitterSim<'a> {
         }
     }
 
-    /// Move a child emitter's particles one frame, without emitting.
-    fn age(&mut self) {
+    /// Gravity and air resistance this frame.
+    fn pull(&self) -> (Vec3, f32) {
         let statics = &self.data.emitter_static;
         let gravity = Vec3::new(
             statics.gravity_dir_x,
             statics.gravity_dir_y,
             statics.gravity_dir_z,
-        ) * statics.gravity_scale;
-        let air = statics.air_res;
+        );
+        (gravity * self.values.x(Slot::Gravity), statics.air_res)
+    }
+
+    /// Move a child emitter's particles one frame, without emitting.
+    fn age(&mut self) {
+        let (gravity, air) = self.pull();
         self.move_particles(gravity, air);
         let rate = self.frame_rate;
         self.time += rate;
@@ -693,7 +717,7 @@ impl<'a> EmitterSim<'a> {
         let step = self.frame_rate;
         let now = self.time - step;
         let follows = self.raw.get(0x753).copied().unwrap_or(0) != 1;
-        let parent_alpha = [f32_at(self.raw, 0x7b8), f32_at(self.raw, 0x7c8)];
+        let parent_alpha = [Slot::Alpha0, Slot::Alpha1].map(|slot| self.values.x(slot));
         let parent_fade = self.fade(0x75b, 0x755);
         let mut children = std::mem::take(&mut self.children);
         let mut anchors: Option<HashMap<u64, Vec3>> = None;
@@ -723,7 +747,7 @@ impl<'a> EmitterSim<'a> {
             let timing = u32_at(raw, 0x7f8) as f32 / 100.0;
             let one_time = flag(0x7f0);
             let duration = u32_at(raw, 0x7fc) as f32;
-            let rate = child.data.emission.rate;
+            let full_rate = child.res_rate();
             let rate_random = i32_at(raw, 0x804) as f32 / 100.0;
             let by_distance = flag(0x7f2);
             for p in 0..self.particles.len() {
@@ -732,6 +756,13 @@ impl<'a> EmitterSim<'a> {
                 if age < start || (one_time && age >= start + duration) {
                     continue;
                 }
+                // Calculate leaves a child emitter's values as the file has them, except one made
+                // for each parent particle: that one animates from its particle's birth. (Its
+                // colours and place are the emitter's, which every such child here shares.)
+                if per_particle {
+                    child.run_anims(age);
+                }
+                let rate = child.rate();
                 let [timer, interval, accumulated] = self.particles[p].child_emission[index];
                 let (n, state) = if by_distance {
                     // Smash 0x8d70 hands a child that emits by distance its parent particle's
@@ -746,7 +777,7 @@ impl<'a> EmitterSim<'a> {
                     }
                 } else if timer >= interval {
                     let r = child.rng.next();
-                    let amount = (accumulated + rate - rate * rate_random * r).max(0.0);
+                    let amount = (accumulated + rate - full_rate * rate_random * r).max(0.0);
                     let n = amount as usize;
                     if n > 0 {
                         (n, [timer - interval + step, interval, amount - n as f32])
@@ -987,14 +1018,30 @@ impl<'a> EmitterSim<'a> {
         }
         let scale = f32_at(raw, 0x3b0);
         for (c, value) in out.iter_mut().take(3).enumerate() {
-            *value *= f32_at(raw, 0x7ac + 4 * c) * scale;
+            *value *= self.values.get(Slot::Colour0)[c] * scale;
         }
-        out[3] *= f32_at(raw, 0x7b8);
+        out[3] *= self.values.x(Slot::Alpha0);
         if byte(0x9e4) != 0 {
             out[3] *= wave(raw, random, age, 0);
             out[3] = out[3].clamp(0.0, 1.0);
         }
         out
+    }
+
+    /// Particles an emission before its random share (TimeEmit, Smash 0x7c30): the equally
+    /// divided spheres keep the resource's, whatever animates it.
+    fn rate(&self) -> f32 {
+        match self.data.shape_info.volume_type {
+            5 | 6 => self.res_rate(),
+            _ => self.values.x(Slot::Rate),
+        }
+    }
+
+    /// The resource's rate (res+0x800) as the runtime reads it: after its load-time fixes, which
+    /// make it 1 for an equally divided circle or line and the number of directions for an
+    /// equally divided sphere (808 emitters).
+    fn res_rate(&self) -> f32 {
+        f32_at(self.raw, 0x800)
     }
 
     /// The next emission interval after an emission (Smash 0x30e0): res+0x808 frames plus one
@@ -1009,7 +1056,11 @@ impl<'a> EmitterSim<'a> {
     /// each emission comes from a new place and angle.
     fn update_matrix_by_emit(&mut self) {
         if self.raw.get(0x758).copied().unwrap_or(0) != 0 {
-            (self.local, self.local_rt) = res_matrix(self.raw, &mut self.rng.lcg);
+            let drawn = res_matrix(self.raw, &mut self.rng.lcg);
+            // An animated emitter's matrix is not this one, but its draws are made all the same.
+            if !self.anims.moves_emitter() {
+                (self.local, self.local_rt) = drawn;
+            }
         }
     }
 
@@ -1104,14 +1155,15 @@ impl<'a> EmitterSim<'a> {
     pub fn dynamic_block(&self, srt: &Mat4, rt: &Mat4, colour: [f32; 4]) -> Vec<u8> {
         let r = self.raw;
         let mut v = [0f32; 48];
-        v[0] = colour[0] * f32_at(r, 0x7ac);
-        v[1] = colour[1] * f32_at(r, 0x7b0);
-        v[2] = colour[2] * f32_at(r, 0x7b4);
-        v[3] = colour[3] * f32_at(r, 0x7b8);
-        v[4] = colour[0] * f32_at(r, 0x7bc);
-        v[5] = colour[1] * f32_at(r, 0x7c0);
-        v[6] = colour[2] * f32_at(r, 0x7c4);
-        v[7] = colour[3] * f32_at(r, 0x7c8);
+        for (row, (tint, alpha)) in [(Slot::Colour0, Slot::Alpha0), (Slot::Colour1, Slot::Alpha1)]
+            .into_iter()
+            .enumerate()
+        {
+            let tint = self.values.get(tint).extend(self.values.x(alpha));
+            for channel in 0..4 {
+                v[4 * row + channel] = colour[channel] * tint[channel];
+            }
+        }
         // The game draws a frame before its time advances: after the spawn frame's Calculate
         // the dynamic block holds time 0 and the fade-in has already taken its first step
         // (live capture: time 4 with fade 5/6). `self.time` counts steps taken, one ahead.
@@ -1312,6 +1364,7 @@ fn from_y(to: Vec3) -> Quat {
 fn spawn_shape(
     data: &EmitterData,
     raw: &[u8],
+    shape_scale: Vec3,
     rng: &mut EmitterRandom,
     divide_counter: &mut i32,
     batch: f32,
@@ -1319,10 +1372,10 @@ fn spawn_shape(
 ) -> (Vec3, Vec3) {
     let shape = &data.shape_info;
     let radius = Vec3::new(
-        shape.volume_radius_x * shape.volume_form_scale_x.max(0.0),
-        shape.volume_radius_y * shape.volume_form_scale_y.max(0.0),
-        shape.volume_radius_z * shape.volume_form_scale_z.max(0.0),
-    );
+        shape.volume_radius_x,
+        shape.volume_radius_y,
+        shape.volume_radius_z,
+    ) * shape_scale.max(Vec3::ZERO);
     let sweep = if shape.sweep_longitude > 0.0 {
         shape.sweep_longitude
     } else {

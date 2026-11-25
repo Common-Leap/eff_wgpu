@@ -1903,3 +1903,163 @@ fn a_childs_matrix_carries_its_parents_own_transform() {
         );
     }
 }
+
+/// `set`'s emitter `name` in a game effect file, with its animation sections.
+fn with_anims<T>(
+    file: &str,
+    set: &str,
+    name: &str,
+    f: impl FnOnce(&mut sim::EmitterSim) -> T,
+) -> Option<T> {
+    let root = std::path::PathBuf::from(std::env::var_os("VFX_GAME_EFFECTS")?);
+    let data = std::fs::read(root.join(file)).unwrap();
+    let eff = effect_library::namco_file::NamcoEffectFile::load(&data).unwrap();
+    let p = eff.ptcl_file.as_ref().unwrap();
+    let sets = &p.emitter_list.emitter_sets;
+    let at = sets.iter().position(|s| s.name == set).unwrap();
+    let emitters = &sets[at].emitters;
+    let index = emitters
+        .iter()
+        .position(|e| e.data.name.as_deref() == Some(name))
+        .unwrap();
+    let raw = &ptcl::emitter_sets(&p.base_bytes)[at].emitters[index];
+    let fixed = static_block::fixed_emitter_data(raw, &|_| None, None);
+    let mut s = sim::EmitterSim::new(&emitters[index].data, &fixed);
+    s.set_anims(sim::Anims::of(&raw.attributes));
+    Some(f(&mut s))
+}
+
+/// The hand of Bayonetta's Witch Time clock is turned by its emitter's rotation animation, a
+/// whole turn in 60 frames. Its particles cannot turn it: their shader has no rotation and
+/// their axis switches are off, so the speed in the file (-6 degrees a frame) does nothing.
+#[test]
+fn the_witch_time_hand_turns_once_in_sixty_frames() {
+    use glam::{Mat4, Vec3};
+    let Some(angles) = with_anims(
+        "fighter/bayonetta/ef_bayonetta.eff",
+        "P_BayonettaWitchTimeClock",
+        "clock1",
+        |s| {
+            (0..60)
+                .map(|_| {
+                    s.step();
+                    let x = s.emitter_srt(&Mat4::IDENTITY).transform_vector3(Vec3::X);
+                    let turned = x.y.atan2(x.x).to_degrees().rem_euclid(360.0);
+                    (turned, x.length())
+                })
+                .collect::<Vec<_>>()
+        },
+    ) else {
+        eprintln!("VFX_GAME_EFFECTS not set; skipped");
+        return;
+    };
+    for (frame, (turned, length)) in angles.into_iter().enumerate() {
+        let want = 6.0 * frame as f32;
+        assert!((turned - want).abs() < 1e-2, "frame {frame}: {turned}");
+        assert!((length - 1.0).abs() < 1e-4);
+    }
+}
+
+/// Witch Time's slow ring fades in on its emitter's opacity: nothing until frame 10, whole from
+/// frame 15.
+#[test]
+fn an_emitters_opacity_runs_on_its_animation() {
+    let alphas = with_anims(
+        "fighter/bayonetta/ef_bayonetta.eff",
+        "P_BayonettaWitchTimeSlow",
+        "ciecle1_sub",
+        |s| {
+            (0..20)
+                .map(|_| {
+                    s.step();
+                    let identity = glam::Mat4::IDENTITY;
+                    let block = s.dynamic_block(&identity, &identity, [1.0; 4]);
+                    f32::from_le_bytes(block[0xc..0x10].try_into().unwrap())
+                })
+                .collect::<Vec<_>>()
+        },
+    );
+    let Some(alphas) = alphas else {
+        eprintln!("VFX_GAME_EFFECTS not set; skipped");
+        return;
+    };
+    for (frame, alpha) in alphas.into_iter().enumerate() {
+        let want = ((frame as f32 - 10.0) / 5.0).clamp(0.0, 1.0);
+        assert!((alpha - want).abs() < 1e-5, "frame {frame}: {alpha}");
+    }
+}
+
+/// Every animation section in the game reads, and drives what it names: over all of them, the
+/// values an emitter ends on are the last keys of the ones that do not loop.
+#[test]
+fn every_animation_section_in_the_game_reads() {
+    let Some(root) = std::env::var_os("VFX_GAME_EFFECTS") else {
+        eprintln!("VFX_GAME_EFFECTS not set; skipped");
+        return;
+    };
+    use eff_wgpu::anim::{Anims, Slot, Values};
+    let slot = |magic: &[u8; 4]| match magic {
+        b"EAES" => Slot::Scale,
+        b"EAER" => Slot::Rotation,
+        b"EAET" => Slot::Translation,
+        b"EAC0" => Slot::Colour0,
+        b"EAC1" => Slot::Colour1,
+        b"EATR" => Slot::Rate,
+        b"EAPL" => Slot::Life,
+        b"EAA0" => Slot::Alpha0,
+        b"EAA1" => Slot::Alpha1,
+        b"EAOV" => Slot::Outward,
+        b"EADV" => Slot::Directed,
+        b"EASL" => Slot::ParticleScale,
+        b"EASS" => Slot::ShapeScale,
+        _ => Slot::Gravity,
+    };
+    fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else if path.extension().is_some_and(|e| e == "eff") {
+                out.push(path);
+            }
+        }
+    }
+    let mut files = Vec::new();
+    walk(std::path::Path::new(&root), &mut files);
+    let (mut sections, mut emitters) = (0, 0);
+    for file in files {
+        let data = std::fs::read(&file).unwrap();
+        let Ok(eff) = effect_library::namco_file::NamcoEffectFile::load(&data) else {
+            continue;
+        };
+        let Some(p) = eff.ptcl_file else { continue };
+        for raw in ptcl::emitter_sets(&p.base_bytes)
+            .iter()
+            .flat_map(|s| &s.emitters)
+        {
+            let anims = Anims::of(&raw.attributes);
+            if anims.is_empty() {
+                continue;
+            }
+            emitters += 1;
+            let mut values = Values::of(&raw.data);
+            values.run(&anims, 1e6, &raw.data);
+            for (magic, d) in &raw.attributes {
+                if !magic.starts_with(b"EA") {
+                    continue;
+                }
+                sections += 1;
+                let keys = u32::from_le_bytes(d[4..8].try_into().unwrap()) as usize;
+                assert_eq!(d.len(), 12 + 16 * keys);
+                if d[1] != 0 || magic == b"EAPL" {
+                    continue;
+                }
+                let last = 12 + 16 * (keys - 1);
+                let x = f32::from_le_bytes(d[last..last + 4].try_into().unwrap());
+                assert_eq!(values.get(slot(magic)).x, x, "{}", file.display());
+            }
+        }
+    }
+    eprintln!("{sections} sections on {emitters} emitters");
+    assert!(sections > 8000 && emitters > 5000);
+}
